@@ -113,3 +113,32 @@ func TestParseVersionLine(t *testing.T) {
 		t.Error("expected error")
 	}
 }
+
+func msixItem(name, family, ver, arch string, id string) *installed.Item {
+	it := &installed.Item{Name: name, Version: ver, MSIX: &platform.MSIXPackage{
+		Name: family[:len(family)-len("_8wekyb3d8bbwe")], FamilyName: family, Version: ver, Architecture: arch,
+		FullName: family[:len(family)-len("_8wekyb3d8bbwe")] + "_" + ver + "_" + arch + "__8wekyb3d8bbwe",
+	}}
+	if id != "" {
+		it.Package = &source.Package{ID: id}
+	}
+	return it
+}
+
+func TestPlanOldVersionsMSIX(t *testing.T) {
+	const rt = "Microsoft.WindowsAppRuntime.1.8"
+	items := []*installed.Item{
+		msixItem("WindowsAppRuntime.1.8", rt+"_8wekyb3d8bbwe", "8000.675.1142.0", "x64", rt),
+		msixItem("WindowsAppRuntime.1.8", rt+"_8wekyb3d8bbwe", "8000.616.304.0", "x64", rt),
+		msixItem("WindowsAppRuntime.1.8", rt+"_8wekyb3d8bbwe", "8000.616.304.0", "x86", rt), // other arch: kept
+		// A different family mapped to the same winget Id must not be
+		// compared with the framework above.
+		msixItem("Windows App Runtime DDLM", "Microsoft.WinAppRuntime.DDLM.8000.675.1142.0-x6_8wekyb3d8bbwe", "8000.675.1142.0", "x64", rt),
+		msixItem("WindowsAppRuntime.1.8 Main", "MicrosoftCorporationII.WinAppRuntime.Main.1.8_8wekyb3d8bbwe", "1.0.0.0", "x64", rt),
+	}
+	groups := PlanOldVersions(items, LineAll, 1)
+	if len(groups) != 1 || !slices.Equal(versions(groups[0].Remove), []string{"8000.616.304.0"}) ||
+		groups[0].Remove[0].MSIX.Architecture != "x64" {
+		t.Fatalf("plan: %+v", groups)
+	}
+}

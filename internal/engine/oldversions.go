@@ -57,11 +57,18 @@ type OldVersionGroup struct {
 }
 
 // productKey decides which installed entries are versions of the same
-// product. Matched packages group by Id; otherwise by normalized display
+// product. MSIX packages group by family name and architecture. Matched
+// packages group by Id; otherwise by normalized display
 // name (version stripped, architecture kept) and publisher. Scope is part
 // of the key so per-user and per-machine installs are never treated as
 // old versions of each other.
 func productKey(it *installed.Item) string {
+	// MSIX: one family per product; different families mapped to the same
+	// winget Id (e.g. a runtime's framework, Main and DDLM packages) must
+	// never be compared with each other.
+	if m := it.MSIX; m != nil {
+		return "msix:" + strings.ToLower(m.FamilyName) + "|" + m.Architecture
+	}
 	scope := ""
 	if it.ARP != nil {
 		scope = it.ARP.Scope

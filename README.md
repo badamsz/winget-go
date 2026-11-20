@@ -68,6 +68,12 @@ winget-go uninstall --name "Python 3.1?.* (64-bit)"  # Python 3.10–3.19, 64-bi
 winget-go uninstall "*Toolbar*" --disable-interactivity
 ```
 
+MSIX packages (frameworks such as `Microsoft.WindowsAppRuntime.*`, `Microsoft.UI.Xaml.*`, `Microsoft.VCLibs.*`, and Store apps) are included and are removed for the current user. To clear out old side-by-side runtimes but keep the newest, combine a pattern with `--old-versions`:
+
+```sh
+winget-go uninstall "Microsoft.WindowsAppRuntime.*" --old-versions=all --dry-run
+```
+
 Quote the pattern so your shell doesn't expand it. If several packages match, winget-go lists them and asks you to confirm. In scripts, pass `--disable-interactivity`; without a terminal winget-go refuses rather than guess. Patterns skip anything on the exclusion list. Native winget doesn't support wildcards, so a wildcard `uninstall` always uses the Go implementation.
 
 ### Removing old versions

@@ -171,7 +171,7 @@ func (e *Engine) Installed() ([]*installed.Item, error) {
 	if err != nil {
 		return nil, err
 	}
-	return installed.List(st, e.Sources)
+	return installed.List(context.Background(), st, e.Sources, e.Err)
 }
 
 // HasWildcard reports whether term is a glob pattern (contains *, ? or [).
@@ -183,7 +183,7 @@ func HasWildcard(term string) bool { return strings.ContainsAny(term, "*?[") }
 // A term containing *, ? or [ is a case-insensitive glob (path.Match
 // syntax) that must match the whole Id or the whole display name, e.g.
 // "Microsoft.DotNet.*" or "Python 3.1?.*". Backslashes are literal so
-// ARP ids (ARP\HKLM\...) can be matched as written. Otherwise an exact Id match
+// ARP and MSIX ids (ARP\Machine\X64\..., MSIX\...) can be matched as written. Otherwise an exact Id match
 // wins; failing that, names (with exact) or Id/name substrings match.
 func (e *Engine) FindInstalled(term string, exact bool) ([]*installed.Item, error) {
 	t := strings.ToLower(term)

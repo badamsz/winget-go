@@ -3,7 +3,11 @@
 package platform
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"unicode/utf16"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -132,9 +137,10 @@ func ReadARP() ([]ARPEntry, error) {
 		scope string
 	}
 	locs := []loc{
-		{registry.LOCAL_MACHINE, "HKLM", registry.WOW64_64KEY, "machine"},
-		{registry.LOCAL_MACHINE, "HKLM32", registry.WOW64_32KEY, "machine"},
-		{registry.CURRENT_USER, "HKCU", 0, "user"},
+		// Key prefixes follow native winget's ARP\<scope>\<arch>\ Ids.
+		{registry.LOCAL_MACHINE, `Machine\X64`, registry.WOW64_64KEY, "machine"},
+		{registry.LOCAL_MACHINE, `Machine\X86`, registry.WOW64_32KEY, "machine"},
+		{registry.CURRENT_USER, `User\X64`, 0, "user"},
 	}
 	seen := map[string]bool{}
 	var out []ARPEntry
@@ -243,4 +249,121 @@ func FindNativeWinget() string {
 		}
 	}
 	return ""
+}
+
+// powershell runs a Windows PowerShell 5.1 script (the Appx module is
+// native there) and returns stdout. The script is passed with
+// -EncodedCommand, so no quoting is involved.
+func powershell(ctx context.Context, script string) ([]byte, error) {
+	exe := filepath.Join(os.Getenv("SystemRoot"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+	if _, err := os.Stat(exe); err != nil {
+		exe = "powershell.exe"
+	}
+	u := utf16.Encode([]rune(script))
+	buf := make([]byte, 2*len(u))
+	for i, c := range u {
+		binary.LittleEndian.PutUint16(buf[2*i:], c)
+	}
+	cmd := exec.CommandContext(ctx, exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+		"-EncodedCommand", base64.StdEncoding.EncodeToString(buf))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return stdout.Bytes(), errors.New(msg)
+	}
+	return stdout.Bytes(), nil
+}
+
+const appxListScript = `$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+$p = @(Get-AppxPackage | Where-Object { -not $_.IsResourcePackage -and -not $_.IsBundle } | ForEach-Object {
+  [pscustomobject]@{
+    Name = $_.Name; FullName = $_.PackageFullName; FamilyName = $_.PackageFamilyName
+    Version = [string]$_.Version; Architecture = [string]$_.Architecture; Publisher = $_.Publisher
+    InstallLocation = $_.InstallLocation; IsFramework = [bool]$_.IsFramework
+    NonRemovable = [bool]$_.NonRemovable; SignatureKind = [string]$_.SignatureKind
+  }
+})
+ConvertTo-Json -InputObject $p -Compress -Depth 2`
+
+// ReadMSIX lists the MSIX/AppX packages registered for the current user
+// (main and framework packages; resource packages and bundles are left
+// out, as in winget) with display names resolved from their manifests.
+func ReadMSIX(ctx context.Context) ([]MSIXPackage, error) {
+	out, err := powershell(ctx, appxListScript)
+	if err != nil {
+		return nil, fmt.Errorf("Get-AppxPackage: %w", err)
+	}
+	pkgs, err := ParseAppxJSON(out)
+	if err != nil {
+		return nil, fmt.Errorf("Get-AppxPackage output: %w", err)
+	}
+	for i := range pkgs {
+		resolveManifestNames(&pkgs[i])
+	}
+	sort.Slice(pkgs, func(i, j int) bool {
+		return strings.ToLower(pkgs[i].DisplayName) < strings.ToLower(pkgs[j].DisplayName)
+	})
+	return pkgs, nil
+}
+
+var (
+	shlwapi                  = windows.NewLazySystemDLL("shlwapi.dll")
+	procSHLoadIndirectString = shlwapi.NewProc("SHLoadIndirectString")
+)
+
+// resolveManifestNames reads DisplayName/PublisherDisplayName from the
+// package's AppxManifest.xml and resolves ms-resource references.
+func resolveManifestNames(p *MSIXPackage) {
+	if p.InstallLocation == "" {
+		return
+	}
+	b, err := os.ReadFile(filepath.Join(p.InstallLocation, "AppxManifest.xml"))
+	if err != nil {
+		return
+	}
+	var m struct {
+		Properties struct {
+			DisplayName          string
+			PublisherDisplayName string
+		}
+	}
+	if xml.Unmarshal(b, &m) != nil {
+		return
+	}
+	if v := resolveManifestString(p, strings.TrimSpace(m.Properties.DisplayName)); v != "" {
+		p.DisplayName = v
+	}
+	if v := resolveManifestString(p, strings.TrimSpace(m.Properties.PublisherDisplayName)); v != "" {
+		p.PublisherDisplayName = v
+	}
+}
+
+func resolveManifestString(p *MSIXPackage, v string) string {
+	uri := MSResourceURI(p.Name, v)
+	if uri == "" {
+		return v // a literal
+	}
+	src, err := windows.UTF16PtrFromString("@{" + p.FullName + "?" + uri + "}")
+	if err != nil {
+		return ""
+	}
+	buf := make([]uint16, 1024)
+	if hr, _, _ := procSHLoadIndirectString.Call(uintptr(unsafe.Pointer(src)), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0); hr != 0 {
+		return ""
+	}
+	return windows.UTF16ToString(buf)
+}
+
+// RemoveMSIX uninstalls an MSIX package for the current user.
+func RemoveMSIX(ctx context.Context, fullName string) error {
+	script := "$ErrorActionPreference = 'Stop'\nRemove-AppxPackage -Package '" + strings.ReplaceAll(fullName, "'", "''") + "'"
+	if _, err := powershell(ctx, script); err != nil {
+		return fmt.Errorf("Remove-AppxPackage %s: %w", fullName, err)
+	}
+	return nil
 }

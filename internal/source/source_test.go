@@ -76,11 +76,13 @@ func fakeCDN(t *testing.T, manifestBody string) (*httptest.Server, *int) {
 		`CREATE TABLE commands2(rowid INTEGER PRIMARY KEY, command TEXT NOT NULL)`,
 		`CREATE TABLE commands2_map(command INT64 NOT NULL, package INT64 NOT NULL)`,
 		`CREATE TABLE productcodes2(productcode TEXT NOT NULL, package INT64 NOT NULL)`,
+		`CREATE TABLE pfns2(pfn TEXT NOT NULL, package INT64 NOT NULL)`,
 		`CREATE TABLE norm_names2(norm_name TEXT NOT NULL, package INT64 NOT NULL)`,
 		`CREATE TABLE norm_publishers2(norm_publisher TEXT NOT NULL, package INT64 NOT NULL)`,
 		`INSERT INTO tags2 VALUES(1,'testing')`, `INSERT INTO tags2_map VALUES(1,1)`,
 		`INSERT INTO commands2 VALUES(1,'ctool')`, `INSERT INTO commands2_map VALUES(1,1)`,
 		`INSERT INTO productcodes2 VALUES('{abc}',1)`,
+		`INSERT INTO pfns2 VALUES('contoso.tool_8wekyb3d8bbwe',1)`,
 		`INSERT INTO norm_names2 VALUES('contosotool',1)`,
 		`INSERT INTO norm_publishers2 VALUES('contoso',1)`,
 	}
@@ -174,6 +176,9 @@ func TestSourceEndToEnd(t *testing.T) {
 		t.Fatal("expected missing version error")
 	}
 
+	if ps, _ := s.ByFamilyName("Contoso.Tool_8wekyb3d8bbwe"); len(ps) != 1 || ps[0].ID != "Contoso.Tool" {
+		t.Errorf("ByFamilyName: %+v", ps)
+	}
 	if ps, _ := s.ByProductCode("{ABC}"); len(ps) != 1 {
 		t.Fatalf("product code lookup: %d", len(ps))
 	}

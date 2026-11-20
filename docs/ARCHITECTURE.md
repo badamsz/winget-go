@@ -60,7 +60,7 @@ flowchart TD
 | `internal/installer` | Installer selection, default switches per technology, argument building, exit codes, execution, portable/zip installs, uninstall command parsing. |
 | `internal/installed` | winget-go install records (`installed.json`), ARP snapshots/diffs, correlation of installed apps to packages. |
 | `internal/github` | GitHub Releases lookup, asset matching, digest-based hashes, response cache. |
-| `internal/platform` | OS boundary: process launch + UAC elevation (`ShellExecuteExW runas`), ARP registry enumeration, user `PATH` edits, native winget discovery. Off Windows, these are stubs. |
+| `internal/platform` | OS boundary: process launch + UAC elevation (`ShellExecuteExW runas`), ARP registry enumeration, MSIX enumeration/removal (Windows PowerShell `Get-AppxPackage` / `Remove-AppxPackage`, manifest display names via `SHLoadIndirectString`), user `PATH` edits, native winget discovery. Off Windows, these are stubs. |
 | `internal/httpx` | Shared HTTP client, User-Agent, streaming download with progress and SHA-256. |
 | `internal/config` | On-disk locations, `sources.json`, environment settings, `winget-go.env` discovery/parsing, version string. |
 | `internal/exclude` | Exclusion lists: pattern parsing (globs on Id, `name:` globs on display name), loading from env/env files/flags/list files, matching. |
@@ -144,15 +144,15 @@ Order: mode → log → scope (`/CURRENTUSER`/`/ALLUSERS` for Inno, `ALLUSERS`/`
 
 **Upgrade** (`engine.Upgrades`): installed items whose matched package has a higher `latest_version` (or a newer GitHub release with `--github`). Each result carries `ExcludedBy` when it matches the exclusion list (§8); excluded packages skip the GitHub lookup. `UpgradeBehavior: uninstallPrevious` uninstalls first; `deny` refuses.
 
-**Uninstall**: portable records → delete links and directory. ARP entries → `msiexec /x {ProductCode}` for Windows Installer products; otherwise `QuietUninstallString`; otherwise `UninstallString` plus technology-specific silent switches (based on the recorded or manifest installer type). After a successful uninstall, only the removed ARP key is dropped from the package's record; the record itself is deleted once it has no keys left. This keeps side-by-side versions tracked correctly.
+**Uninstall**: portable records → delete links and directory. MSIX packages → `Remove-AppxPackage -Package <FullName>` for the current user (`NonRemovable` packages are refused; Windows refuses frameworks other packages depend on). ARP entries → `msiexec /x {ProductCode}` for Windows Installer products; otherwise `QuietUninstallString`; otherwise `UninstallString` plus technology-specific silent switches (based on the recorded or manifest installer type). After a successful uninstall, only the removed ARP key is dropped from the package's record; the record itself is deleted once it has no keys left. This keeps side-by-side versions tracked correctly.
 
 **Bulk confirmation** (`confirmBulk`): `--disable-interactivity` proceeds without asking. On a TTY it prompts Y/N. With no TTY and no flag it refuses, so a script can't remove more than intended.
 
-**Matching installed packages** (`engine.FindInstalled`, used by `uninstall` and `uninstall --old-versions`): a plain term prefers an exact Id match, then exact names (`-e`) or Id/name substrings. A term containing `*`, `?` or `[` is a case-insensitive `path.Match` glob that must match the **whole** Id or display name. Backslashes are literal, so `ARP\HKLM\…` Ids can be matched as written. Invalid patterns are an error. For a wildcard `uninstall`, the CLI drops excluded entries (§8). When more than one entry matches, it lists them and asks for confirmation (`confirmBulk`). `--all-versions` is not needed, because the pattern already says "many". A plain term that matches several entries still requires `--all-versions`. Bulk uninstalls go through `uninstallEach`, which keeps going after a failure and reports all failures at the end.
+**Matching installed packages** (`engine.FindInstalled`, used by `uninstall` and `uninstall --old-versions`): a plain term prefers an exact Id match, then exact names (`-e`) or Id/name substrings. A term containing `*`, `?` or `[` is a case-insensitive `path.Match` glob that must match the **whole** Id or display name. Backslashes are literal, so `ARP\Machine\X64\…` and `MSIX\…` Ids can be matched as written. Invalid patterns are an error. For a wildcard `uninstall`, the CLI drops excluded entries (§8). When more than one entry matches, it lists them and asks for confirmation (`confirmBulk`). `--all-versions` is not needed, because the pattern already says "many". A plain term that matches several entries still requires `--all-versions`. Bulk uninstalls go through `uninstallEach`, which keeps going after a failure and reports all failures at the end.
 
 **Old-version cleanup** (`uninstall --old-versions[=major|minor|all] [--keep N] [--dry-run]`): `engine.PlanOldVersions` is a pure function over installed items, so it is unit-tested without Windows.
 
-1. **Product key**: the package Id when matched, otherwise `source.NameKey(displayName)` plus normalized publisher. Either way the architecture suffix and the ARP scope (user/machine) are part of the key, so x86/x64 and per-user/per-machine installs are never "old versions" of each other.
+1. **Product key**: for MSIX, the package family name plus architecture. Several families can map to one winget Id (a runtime's framework, Main, Singleton and DDLM packages), and those must never be compared. Otherwise, the package Id when matched, otherwise `source.NameKey(displayName)` plus normalized publisher. Either way the architecture suffix and the ARP scope (user/machine) are part of the key, so x86/x64 and per-user/per-machine installs are never "old versions" of each other.
 2. **Version line**: `version.Prefix(v, 1)` for `major`, `version.Prefix(v, 2)` for `minor`, and one line for `all`. Items with an empty or `Unknown` version are skipped.
 3. **Selection**: each line is sorted newest first and the first `keep` items are kept. The rest are removed only if strictly older than the oldest kept version, so duplicates of a kept version are never touched.
 
@@ -162,12 +162,13 @@ The CLI applies the exclusion list (§8) before planning, prints a keep/REMOVE t
 
 `installed.List` merges:
 
-1. **ARP entries** from `HKLM` (64-bit and 32-bit views) and `HKCU` `…\CurrentVersion\Uninstall`. System components and updates are skipped.
-2. **winget-go records** (`installed.json`). Each install snapshots ARP before and after running the installer and stores the keys that changed. This is the same technique winget uses, and it gives an exact package↔ARP mapping for anything winget-go installed.
-3. For other ARP entries, matching falls back to **product code** (`productcodes2`, lowercased key name) and then to **normalized name** (`norm_names2`). Ties are broken by **normalized publisher** (`norm_publishers2`). `source.NormalizeName` approximates winget's `NameNormalizer`: it strips versions, locales and parentheticals, and emits arch-suffixed variants such as `mozillafirefox(X64)`.
-4. **Portable records** that have no ARP entry.
+1. **ARP entries** from `HKLM` (64-bit and 32-bit views) and `HKCU` `…\CurrentVersion\Uninstall`. System components and updates are skipped. Keys use native winget's Id format (`Machine\X64\…`, `Machine\X86\…`, `User\X64\…`), so Ids copied from native `winget list` work. Records written by older builds (`HKLM\…`, `HKLM32\…`, `HKCU\…`) are translated by `platform.LegacyARPKey`.
+2. **MSIX packages** registered for the current user. `platform.ReadMSIX` runs Windows PowerShell 5.1 `Get-AppxPackage` (passed with `-EncodedCommand`, output as JSON) and skips resource packages and bundles. It then reads `DisplayName`/`PublisherDisplayName` from each `AppxManifest.xml` and resolves `ms-resource:` references with `SHLoadIndirectString`. Packages match the source by **package family name** (`pfns2`). Unmatched ones get the Id `MSIX\<PackageFullName>`, as in winget. If PowerShell fails, `list` prints a warning and continues with ARP only.
+3. **winget-go records** (`installed.json`). Each install snapshots ARP before and after running the installer and stores the keys that changed. This is the same technique winget uses, and it gives an exact package↔ARP mapping for anything winget-go installed.
+4. For other ARP entries, matching falls back to **product code** (`productcodes2`, lowercased key name) and then to **normalized name** (`norm_names2`). Ties are broken by **normalized publisher** (`norm_publishers2`). `source.NormalizeName` approximates winget's `NameNormalizer`: it strips versions, locales and parentheticals, and emits arch-suffixed variants such as `mozillafirefox(X64)`.
+5. **Portable records** that have no ARP entry. Records for MSIX installs link to the MSIX item by package Id.
 
-MSIX packages (`Get-AppxPackage`) are not enumerated yet.
+MSIX versions are shown raw (e.g. `8000.675.1142.0`). winget instead maps them to the manifest version (e.g. `1.8.10`). They often don't compare with `PackageVersion`, so **MSIX items are left out of `upgrade`**.
 
 ## 7. GitHub Releases integration
 
@@ -242,7 +243,7 @@ Enabled with `--github` on `install`, `upgrade`, `download`, `show`, `list` and 
 * No `msstore` or REST (`Microsoft.Rest`) sources; no MSIX signature verification of the source package.
 * No `configure` (DSC), `pin`, `repair` or `settings` in the portable backend.
 * ARP correlation is heuristic for software not installed by winget-go, and ARP version ranges (`arp_min/max_version`) are not used yet.
-* No MSIX enumeration for `list`; no Windows feature/library dependency installation (reported only).
+* MSIX: per-user only (no `-AllUsers`/provisioned packages), raw MSIX versions, and no upgrades for MSIX items. Enumeration needs Windows PowerShell. No Windows feature/library dependency installation (reported only).
 * Output is winget-style but not byte-identical.
 
 ## 13. Build, test, CI and dependency updates

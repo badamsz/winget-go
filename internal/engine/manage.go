@@ -41,6 +41,23 @@ func (e *Engine) Uninstall(ctx context.Context, it *installed.Item, o UninstallO
 		fmt.Fprintln(e.Out, "Successfully uninstalled")
 		return st.Save()
 	}
+	if m := it.MSIX; m != nil {
+		if m.NonRemovable {
+			return fmt.Errorf("%s is a system package and can't be removed", it.Name)
+		}
+		fmt.Fprintf(e.Out, "Starting package uninstall of %s...\n", it.Name)
+		if err := platform.RemoveMSIX(ctx, m.FullName); err != nil {
+			return err
+		}
+		if rec != nil {
+			st.Remove(rec.ID)
+			if err := st.Save(); err != nil {
+				return err
+			}
+		}
+		fmt.Fprintln(e.Out, "Successfully uninstalled")
+		return nil
+	}
 	a := it.ARP
 	if a == nil {
 		return fmt.Errorf("%s has no uninstall information", it.Name)
@@ -63,7 +80,7 @@ func (e *Engine) Uninstall(ctx context.Context, it *installed.Item, o UninstallO
 		// versions); forget only the one that was removed.
 		var keep []string
 		for _, k := range rec.ARPKeys {
-			if !strings.EqualFold(k, a.Key) {
+			if !strings.EqualFold(platform.LegacyARPKey(k), a.Key) {
 				keep = append(keep, k)
 			}
 		}
@@ -148,7 +165,10 @@ func (e *Engine) Upgrades(ctx context.Context, includeUnknown bool) ([]Upgrade, 
 	}
 	var out []Upgrade
 	for _, it := range items {
-		if it.Package == nil {
+		// MSIX versions often differ from the manifest's PackageVersion
+		// (e.g. 8000.675.1142.0 for WindowsAppRuntime 1.8.x), so comparing
+		// them would report bogus upgrades.
+		if it.Package == nil || it.MSIX != nil {
 			continue
 		}
 		cur := it.Version

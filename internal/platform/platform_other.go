@@ -20,3 +20,9 @@ func AddToUserPath(dir string) (bool, error) { return false, ErrUnsupported }
 
 // FindNativeWinget never finds anything off Windows.
 func FindNativeWinget() string { return "" }
+
+// ReadMSIX returns no packages off Windows.
+func ReadMSIX(ctx context.Context) ([]MSIXPackage, error) { return nil, nil }
+
+// RemoveMSIX is unsupported off Windows.
+func RemoveMSIX(ctx context.Context, fullName string) error { return ErrUnsupported }

@@ -14,15 +14,20 @@ func TestMatchInstalledWildcard(t *testing.T) {
 		arp("Python 3.11.9 (64-bit)", "3.11.9", "PSF", "machine"),
 		arp("Python 3.12.1 (64-bit)", "3.12.1", "PSF", "machine"),
 		arp("Python Launcher", "3.12.1", "PSF", "machine"),
+		msixItem("WindowsAppRuntime.1.7", "Microsoft.WindowsAppRuntime.1.7_8wekyb3d8bbwe", "7000.1.0.0", "x64", "Microsoft.WindowsAppRuntime.1.7"),
+		msixItem("Snipping Tool", "Microsoft.ScreenSketch_8wekyb3d8bbwe", "11.2609.15.0", "x64", ""),
 	}
 	cases := map[string][]string{
-		"microsoft.dotnet.*":     {"8.0.11", "8.0.404"},
-		"microsoft.dotnet.sdk.?": {"8.0.404"},
-		"python 3.1[12].* (*)":   {"3.11.9", "3.12.1"},
-		"python *":               {"3.11.9", "3.12.1", "3.12.1"},
-		"python":                 nil, // glob must match the whole name
-		"*launcher":              {"3.12.1"},
-		`arp\hklm\python 3.12*`:  {"3.12.1"}, // backslashes are literal
+		"microsoft.dotnet.*":            {"8.0.11", "8.0.404"},
+		"microsoft.dotnet.sdk.?":        {"8.0.404"},
+		"python 3.1[12].* (*)":          {"3.11.9", "3.12.1"},
+		"python *":                      {"3.11.9", "3.12.1", "3.12.1"},
+		"python":                        nil, // glob must match the whole name
+		"*launcher":                     {"3.12.1"},
+		"microsoft.windowsappruntime.*": {"7000.1.0.0"},
+		"windowsappruntime.*":           {"7000.1.0.0"}, // display name
+		`msix\microsoft.screensketch_*`: {"11.2609.15.0"},
+		`arp\hklm\python 3.12*`:         {"3.12.1"}, // backslashes are literal
 	}
 	for pattern, want := range cases {
 		got := versions(matchInstalled(items, globPattern(pattern), false, true))

@@ -1,6 +1,9 @@
 package installed
 
 import (
+	"context"
+	"fmt"
+	"io"
 	"strings"
 
 	"winget-go/internal/platform"
@@ -12,9 +15,10 @@ type Item struct {
 	Name      string
 	Version   string
 	Publisher string
-	ARP       *platform.ARPEntry // nil for portable packages
-	Record    *Record            // set when installed by winget-go
-	Package   *source.Package    // matched package (nil if unknown)
+	ARP       *platform.ARPEntry    // Apps & Features entry, if any
+	MSIX      *platform.MSIXPackage // MSIX/AppX package, if any
+	Record    *Record               // set when installed by winget-go
+	Package   *source.Package       // matched package (nil if unknown)
 }
 
 // ID returns the package id or the ARP key name for unmatched entries.
@@ -26,6 +30,8 @@ func (it *Item) ID() string {
 		return it.Record.ID
 	case it.ARP != nil:
 		return "ARP\\" + it.ARP.Key
+	case it.MSIX != nil:
+		return "MSIX\\" + it.MSIX.FullName
 	}
 	return ""
 }
@@ -38,18 +44,24 @@ func (it *Item) SourceName() string {
 	return ""
 }
 
-// List enumerates installed applications and correlates them with the
-// given sources: first via winget-go's own install records (exact), then
-// ARP product codes, then normalized name/publisher.
-func List(st *State, sources []*source.Source) ([]*Item, error) {
+// List enumerates installed applications (ARP entries and MSIX
+// packages) and correlates them with the given sources: first via
+// winget-go's own install records (exact), then ARP product codes or MSIX
+// package family names, then normalized name/publisher. MSIX enumeration
+// failures are reported on warn (if non-nil) and otherwise ignored.
+func List(ctx context.Context, st *State, sources []*source.Source, warn io.Writer) ([]*Item, error) {
 	arp, err := platform.ReadARP()
 	if err != nil {
 		return nil, err
 	}
+	msix, err := platform.ReadMSIX(ctx)
+	if err != nil && warn != nil {
+		fmt.Fprintf(warn, "warning: MSIX packages are not listed: %v\n", err)
+	}
 	byKey := map[string]*Record{}
 	for _, r := range st.Packages {
 		for _, k := range r.ARPKeys {
-			byKey[strings.ToLower(k)] = r
+			byKey[strings.ToLower(platform.LegacyARPKey(k))] = r
 		}
 	}
 	lookup := func(id, srcName string) *source.Package {
@@ -83,6 +95,25 @@ func List(st *State, sources []*source.Source) ([]*Item, error) {
 			}
 			if ps, _ := s.ByNormalizedName(e.DisplayName, e.Publisher); len(ps) == 1 {
 				it.Package = ps[0]
+			}
+		}
+		items = append(items, it)
+	}
+	for i := range msix {
+		m := &msix[i]
+		it := &Item{Name: m.DisplayName, Version: m.Version, Publisher: m.PublisherDisplayName, MSIX: m}
+		for _, s := range sources {
+			if ps, _ := s.ByFamilyName(m.FamilyName); len(ps) == 1 {
+				it.Package = ps[0]
+				break
+			}
+		}
+		// MSIX installs leave no ARP entry, so their record (if winget-go
+		// installed them) is linked by package Id instead.
+		if it.Package != nil {
+			if r := st.Get(it.Package.ID); r != nil && len(r.ARPKeys) == 0 && !used[r] {
+				it.Record = r
+				used[r] = true
 			}
 		}
 		items = append(items, it)

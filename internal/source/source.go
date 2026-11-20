@@ -263,6 +263,12 @@ func (s *Source) ByProductCode(code string) ([]*Package, error) {
 		strings.ToLower(code))
 }
 
+// ByFamilyName finds packages that declare an MSIX package family name.
+func (s *Source) ByFamilyName(pfn string) ([]*Package, error) {
+	return s.collect(`SELECT `+pkgCols+` FROM pfns2 f JOIN packages p ON p.rowid = f.package WHERE f.pfn = ?`,
+		strings.ToLower(pfn))
+}
+
 // ByNormalizedName finds packages by normalized ARP display name; when
 // several match and publisher is given, those whose normalized publisher
 // also matches are preferred.
