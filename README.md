@@ -168,6 +168,7 @@ Native winget doesn't support exclusions. So when exclusions are configured, `up
 ## Documentation
 
 * [Architecture](docs/ARCHITECTURE.md): design, data formats, install pipeline and known gaps. Update it with every structural change.
+* [Changelog](CHANGELOG.md): what changed in each release.
 
 ## Development
 
@@ -176,4 +177,8 @@ go test ./...                 # offline; uses a fake source server
 GOOS=windows go vet ./...     # check the Windows build
 ```
 
-CI runs on Linux, Windows and macOS and builds binaries for every target. Pushing a `v*` tag publishes a release. Renovate keeps Go modules, the toolchain and Actions up to date.
+CI runs on Linux, Windows and macOS and builds binaries for every target. To release, add a `## [x.y.z]` section to `CHANGELOG.md`, then push a `vx.y.z` tag. The release workflow builds and publishes it, using that section as the notes. Renovate keeps Go modules, the toolchain and Actions up to date.
+
+## License
+
+[MIT](LICENSE)

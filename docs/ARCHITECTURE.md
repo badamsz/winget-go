@@ -262,7 +262,7 @@ Enabled with `--github` on `install`, `upgrade`, `download`, `show`, `list` and 
 
 * `go test ./...` runs offline. `internal/source` serves a synthetic v2 source (SQLite index in an MSIX, MSZIP version data, manifest) from `httptest`, and `internal/github` mocks the API.
 * **CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)): gofmt, `go vet` for the host and for `GOOS=windows`, and `go test -race` on Ubuntu, Windows and macOS. It then cross-compiles windows/{amd64,arm64,386}, linux/{amd64,arm64} and darwin/{amd64,arm64} and uploads the binaries as artifacts.
-* **Release** ([`.github/workflows/release.yml`](../.github/workflows/release.yml)): pushing a `v*` tag builds every target with `-X winget-go/internal/config.Version=<tag>`, packages zips/tarballs (binary, README, `winget-go.env.example`) with `SHA256SUMS`, and creates a GitHub release.
+* **Release** ([`.github/workflows/release.yml`](../.github/workflows/release.yml)): pushing a `v*` tag builds every target with `-X winget-go/internal/config.Version=<tag>`, packages zips/tarballs (binary, README, CHANGELOG, LICENSE, `winget-go.env.example`) with `SHA256SUMS`, and creates a GitHub release. The notes are the tag's `## [x.y.z]` section of [`CHANGELOG.md`](../CHANGELOG.md); the job fails if that section is missing, so add the section before tagging.
 * `internal/exclude` tests that the shipped `winget-go.env.example` parses and that its patterns are valid.
 * **Renovate** ([`renovate.json`](../renovate.json)): weekly grouped PRs for Go modules (with `go mod tidy`), the Go toolchain directive and GitHub Actions (pinned to digests). Vulnerability alerts are raised immediately. The Renovate GitHub App must be installed on the repository.
 

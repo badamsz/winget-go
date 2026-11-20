@@ -33,7 +33,7 @@ jobs:
             GOOS=$GOOS GOARCH=$GOARCH go build -trimpath \
               -ldflags "-s -w -X winget-go/internal/config.Version=${VERSION#v}" \
               -o "build/$name/winget-go${ext}" ./cmd/winget-go
-            cp README.md winget-go.env.example LICENSE* "build/$name/" 2>/dev/null || true
+            cp README.md CHANGELOG.md LICENSE winget-go.env.example "build/$name/"
             if [ "$GOOS" = windows ]; then
               (cd build && zip -qr "../dist/$name.zip" "$name")
             else
@@ -41,7 +41,23 @@ jobs:
             fi
           done
           (cd dist && sha256sum * > SHA256SUMS)
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # The "## [x.y.z]" section for this tag, up to the next heading
+          # or the link references at the bottom.
+          awk -v v="${VERSION#v}" '
+            /^## \[/ { if (on) exit; on = index($0, "[" v "]") > 0; next }
+            /^\[[^]]+\]: / { if (on) exit }
+            on
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for ${VERSION#v}"
+            exit 1
+          fi
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/* --generate-notes --verify-tag
+        run: gh release create "${{ github.ref_name }}" dist/* --title "winget-go ${{ github.ref_name }}" --notes-file notes.md --verify-tag
