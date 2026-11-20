@@ -257,6 +257,12 @@ func uninstallCmd(o Options) *cobra.Command {
 		Short: "Uninstalls the given package",
 		Long: `Uninstalls the given package.
 
+The query may be a wildcard pattern (*, ?, [...]) matched case-insensitively
+against the whole Id or display name, e.g. "Microsoft.DotNet.Runtime.*" or
+"Python 3.1?.*". Quote it so your shell doesn't expand it. A pattern may match
+several packages; they are listed and you are asked to confirm (or pass
+--disable-interactivity). Patterns honour the exclusion list.
+
 With --old-versions, removes outdated side-by-side versions instead: installed
 entries of the same product are grouped by version line and everything older
 than the newest --keep versions in each line is uninstalled.
@@ -293,25 +299,40 @@ is considered (honouring the exclusion list). Use --dry-run to preview.`,
 			if err != nil {
 				return err
 			}
+			wildcard := engine.HasWildcard(term)
+			if wildcard {
+				// A pattern can sweep up more than intended, so it honours
+				// the exclusion list like --old-versions does.
+				if e.Exclusions, err = ex.load(); err != nil {
+					return err
+				}
+				var excluded int
+				items, excluded = filterExcluded(e, items)
+				if excluded > 0 {
+					fmt.Fprintf(o.Stdout, "Skipped %d installed entries matched by the exclusion list.\n", excluded)
+				}
+			}
 			if len(items) == 0 {
 				fmt.Fprintln(o.Stdout, "No installed package found matching input criteria.")
 				return engine.ErrNoMatch
 			}
-			if len(items) > 1 && !all {
+			if len(items) > 1 {
 				t := table{headers: []string{"Name", "Id", "Version"}}
 				for _, it := range items {
 					t.add(it.Name, it.ID(), it.Version)
 				}
 				t.print(o.Stdout)
-				return errors.New("multiple installed packages match; refine the query, pass --all-versions, or use --old-versions to remove only outdated ones")
-			}
-			for _, it := range items {
-				fmt.Fprintf(o.Stdout, "Found %s [%s]\n", it.Name, it.ID())
-				if err := e.Uninstall(cmd.Context(), it, engine.UninstallOptions{Mode: mode}); err != nil {
-					return err
+				if !wildcard && !all {
+					return errors.New("multiple installed packages match; refine the query, pass --all-versions, or use --old-versions to remove only outdated ones")
+				}
+				if wildcard {
+					fmt.Fprintf(o.Stdout, "%d installed package(s) match %q.\n", len(items), term)
+					if err := confirmBulk(cmd, o, "Uninstall these packages?"); err != nil {
+						return err
+					}
 				}
 			}
-			return nil
+			return uninstallEach(cmd, o, e, items, mode, "package(s)")
 		},
 	}
 	q.register(cmd, false)
@@ -361,19 +382,7 @@ func uninstallOldVersions(cmd *cobra.Command, o Options, q *queryFlags, ex *excl
 	if err != nil {
 		return err
 	}
-	var candidates []*installed.Item
-	excluded := 0
-	for _, it := range items {
-		id := ""
-		if it.Package != nil {
-			id = it.Package.ID
-		}
-		if _, ok := e.IsExcluded(id, it.Name); ok {
-			excluded++
-			continue
-		}
-		candidates = append(candidates, it)
-	}
+	candidates, excluded := filterExcluded(e, items)
 	groups := engine.PlanOldVersions(candidates, line, keep)
 	if excluded > 0 {
 		fmt.Fprintf(o.Stdout, "Skipped %d installed entries matched by the exclusion list.\n", excluded)
@@ -399,25 +408,67 @@ func uninstallOldVersions(cmd *cobra.Command, o Options, q *queryFlags, ex *excl
 		fmt.Fprintln(o.Stdout, "Dry run: nothing was uninstalled.")
 		return nil
 	}
-	noPrompt, _ := cmd.Flags().GetBool("disable-interactivity")
-	if !noPrompt && isTerminal(os.Stdin) {
-		fmt.Fprint(o.Stdout, "Uninstall these versions? [Y/N]: ")
-		var answer string
-		fmt.Fscanln(os.Stdin, &answer)
-		if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
-			return errors.New("cancelled")
-		}
+	if err := confirmBulk(cmd, o, "Uninstall these versions?"); err != nil {
+		return err
 	}
+	return uninstallEach(cmd, o, e, targets, mode, "old version(s)")
+}
+
+// filterExcluded drops items on the engine's exclusion list and returns
+// how many were dropped.
+func filterExcluded(e *engine.Engine, items []*installed.Item) ([]*installed.Item, int) {
+	var keep []*installed.Item
+	excluded := 0
+	for _, it := range items {
+		id := ""
+		if it.Package != nil {
+			id = it.Package.ID
+		}
+		if _, ok := e.IsExcluded(id, it.Name); ok {
+			excluded++
+			continue
+		}
+		keep = append(keep, it)
+	}
+	return keep, excluded
+}
+
+// confirmBulk asks before removing several entries at once. It prompts on
+// a terminal; --disable-interactivity accepts without asking. Without a
+// terminal and without that flag it refuses, so a script can't remove
+// more than it meant to by accident.
+func confirmBulk(cmd *cobra.Command, o Options, prompt string) error {
+	if noPrompt, _ := cmd.Flags().GetBool("disable-interactivity"); noPrompt {
+		return nil
+	}
+	if !isTerminal(os.Stdin) {
+		return errors.New("refusing to uninstall several entries without confirmation; pass --disable-interactivity to proceed non-interactively")
+	}
+	fmt.Fprintf(o.Stdout, "%s [Y/N]: ", prompt)
+	var answer string
+	fmt.Fscanln(os.Stdin, &answer)
+	if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+		return errors.New("cancelled")
+	}
+	return nil
+}
+
+// uninstallEach uninstalls every item, continuing past failures and
+// reporting them together.
+func uninstallEach(cmd *cobra.Command, o Options, e *engine.Engine, items []*installed.Item, mode installer.Mode, what string) error {
 	var failed []string
-	for _, it := range targets {
-		fmt.Fprintf(o.Stdout, "Removing %s %s...\n", it.Name, it.Version)
+	for _, it := range items {
+		fmt.Fprintf(o.Stdout, "Uninstalling %s %s [%s]...\n", it.Name, it.Version, it.ID())
 		if err := e.Uninstall(cmd.Context(), it, engine.UninstallOptions{Mode: mode}); err != nil {
+			if len(items) == 1 {
+				return err
+			}
 			fmt.Fprintf(o.Stderr, "  %v\n", err)
-			failed = append(failed, it.Name+" "+it.Version)
+			failed = append(failed, strings.TrimSpace(it.Name+" "+it.Version))
 		}
 	}
 	if len(failed) > 0 {
-		return fmt.Errorf("%d of %d old version(s) failed to uninstall: %s", len(failed), len(targets), strings.Join(failed, "; "))
+		return fmt.Errorf("%d of %d %s failed to uninstall: %s", len(failed), len(items), what, strings.Join(failed, "; "))
 	}
 	return nil
 }

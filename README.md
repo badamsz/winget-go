@@ -29,6 +29,7 @@ winget-go install --id 7zip.7zip -e --silent
 winget-go list --upgrade-available
 winget-go upgrade --all
 winget-go uninstall 7zip.7zip
+winget-go uninstall "Microsoft.DotNet.Runtime.*"
 winget-go uninstall python --old-versions=minor --dry-run
 winget-go download --id jqlang.jq -e -d ./installers -a arm64
 winget-go export -o packages.json && winget-go import -i packages.json
@@ -57,6 +58,18 @@ winget-go upgrade --github                    # include GitHub releases in upgra
 
 The installer hash comes from GitHub's published asset digest. If GitHub has no digest for an asset, winget-go refuses to install it unless you pass `--ignore-security-hash`. Set `GITHUB_TOKEN` to raise the API rate limit.
 
+### Uninstalling with wildcards
+
+`uninstall` accepts a wildcard pattern (`*`, `?`, `[...]`, case-insensitive). The pattern must match the whole package Id or the whole display name:
+
+```sh
+winget-go uninstall "Microsoft.DotNet.Runtime.*"     # every .NET runtime
+winget-go uninstall --name "Python 3.1?.* (64-bit)"  # Python 3.10–3.19, 64-bit
+winget-go uninstall "*Toolbar*" --disable-interactivity
+```
+
+Quote the pattern so your shell doesn't expand it. If several packages match, winget-go lists them and asks you to confirm. In scripts, pass `--disable-interactivity`; without a terminal winget-go refuses rather than guess. Patterns skip anything on the exclusion list. Native winget doesn't support wildcards, so a wildcard `uninstall` always uses the Go implementation.
+
 ### Removing old versions
 
 Some products leave older versions installed side by side (Python, .NET runtimes, Java, Visual C++ runtimes, …). `uninstall --old-versions` removes the outdated ones and keeps the newest in each version line:
@@ -77,7 +90,7 @@ winget-go uninstall java --old-versions --keep 2      # keep the two newest per 
 
 Put the value after `=` (`--old-versions=minor`). Without the `=`, the word would be read as a package query, so winget-go refuses it.
 
-Entries count as the same product only if they share a package Id (or display name and publisher), the same architecture, and the same per-user or per-machine scope. Only versions strictly older than every version being kept are removed. Entries with no version are left alone. Without a query, every installed product is checked and the exclusion list applies. On a terminal you are asked to confirm; `--disable-interactivity` skips the prompt.
+Entries count as the same product only if they share a package Id (or display name and publisher), the same architecture, and the same per-user or per-machine scope. Only versions strictly older than every version being kept are removed. Entries with no version are left alone. Without a query, every installed product is checked and the exclusion list applies. On a terminal you are asked to confirm. `--disable-interactivity` skips the prompt and is required when there is no terminal. The query can be a wildcard pattern, e.g. `"Microsoft.DotNet.*"`.
 
 ### Exclusions
 
@@ -89,7 +102,7 @@ winget-go upgrade --all --exclude-file ./exclusions.txt
 winget-go upgrade --all --no-exclude          # ignore every exclusion for this run
 ```
 
-Exclusions also protect packages from `uninstall --old-versions`.
+Exclusions also protect packages from `uninstall --old-versions` and from wildcard `uninstall` patterns.
 
 Patterns are case-insensitive wildcards (`*`, `?`, `[...]`) matched against the package Id. Start a pattern with `name:` to match the display name instead, e.g. `name:Visual Studio *`. An excluded package still appears in `list` (marked `(excluded)`) and in a footer after `upgrade`. Asking to upgrade it by name fails until you pass `--no-exclude`.
 

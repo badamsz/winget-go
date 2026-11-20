@@ -30,7 +30,9 @@ flowchart TD
     G -- yes --> P
     G -- no --> XC{exclusions configured and<br/>upgrade / import / list --upgrade-available?}
     XC -- yes --> P
-    XC -- no --> F{winget.exe found?}
+    XC -- no --> WU{uninstall with a<br/>wildcard query?}
+    WU -- yes --> P
+    WU -- no --> F{winget.exe found?}
     F -- yes --> X
     F -- no --> P
     X -- failed to start --> P
@@ -41,6 +43,7 @@ flowchart TD
 * Native winget discovery ([`platform.FindNativeWinget`](../internal/platform/platform_windows.go)) checks `PATH`, the App Execution Alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`, then `%ProgramFiles%\WindowsApps\Microsoft.DesktopAppInstaller_*` (needed under `SYSTEM`). It never returns its own executable, so it is safe to install winget-go as `winget.exe`.
 * Env files (§8) are loaded **before** the decision, because they may set `WINGET_GO_BACKEND` or exclusions.
 * Native winget has no exclusion support. When exclusions are configured, commands that honour them run on the portable backend in auto mode. An explicit `--backend native` gets a warning that the exclusions are ignored.
+* Native winget treats `*` in a query literally, so an `uninstall`/`remove`/`rm` whose positional query or flag value contains `*`, `?` or `[` runs on the portable backend in auto mode. An explicit `--backend native` gets a warning.
 * `WINGET_GO_DEBUG=1` prints the decision; `winget-go --info` (portable backend) shows it too.
 
 ## 3. Package map
@@ -143,13 +146,17 @@ Order: mode → log → scope (`/CURRENTUSER`/`/ALLUSERS` for Inno, `ALLUSERS`/`
 
 **Uninstall**: portable records → delete links and directory. ARP entries → `msiexec /x {ProductCode}` for Windows Installer products; otherwise `QuietUninstallString`; otherwise `UninstallString` plus technology-specific silent switches (based on the recorded or manifest installer type). After a successful uninstall, only the removed ARP key is dropped from the package's record; the record itself is deleted once it has no keys left. This keeps side-by-side versions tracked correctly.
 
+**Bulk confirmation** (`confirmBulk`): `--disable-interactivity` proceeds without asking. On a TTY it prompts Y/N. With no TTY and no flag it refuses, so a script can't remove more than intended.
+
+**Matching installed packages** (`engine.FindInstalled`, used by `uninstall` and `uninstall --old-versions`): a plain term prefers an exact Id match, then exact names (`-e`) or Id/name substrings. A term containing `*`, `?` or `[` is a case-insensitive `path.Match` glob that must match the **whole** Id or display name. Backslashes are literal, so `ARP\HKLM\…` Ids can be matched as written. Invalid patterns are an error. For a wildcard `uninstall`, the CLI drops excluded entries (§8). When more than one entry matches, it lists them and asks for confirmation (`confirmBulk`). `--all-versions` is not needed, because the pattern already says "many". A plain term that matches several entries still requires `--all-versions`. Bulk uninstalls go through `uninstallEach`, which keeps going after a failure and reports all failures at the end.
+
 **Old-version cleanup** (`uninstall --old-versions[=major|minor|all] [--keep N] [--dry-run]`): `engine.PlanOldVersions` is a pure function over installed items, so it is unit-tested without Windows.
 
 1. **Product key**: the package Id when matched, otherwise `source.NameKey(displayName)` plus normalized publisher. Either way the architecture suffix and the ARP scope (user/machine) are part of the key, so x86/x64 and per-user/per-machine installs are never "old versions" of each other.
 2. **Version line**: `version.Prefix(v, 1)` for `major`, `version.Prefix(v, 2)` for `minor`, and one line for `all`. Items with an empty or `Unknown` version are skipped.
 3. **Selection**: each line is sorted newest first and the first `keep` items are kept. The rest are removed only if strictly older than the oldest kept version, so duplicates of a kept version are never touched.
 
-The CLI applies the exclusion list (§8) before planning, prints a keep/REMOVE table, stops for `--dry-run`, confirms on a TTY unless `--disable-interactivity` is set, then uninstalls each target and reports failures together. `--old-versions` uses `NoOptDefVal`, so a bare `major`/`minor`/`all` positional is rejected with a hint to use `=`.
+The CLI applies the exclusion list (§8) before planning, prints a keep/REMOVE table, stops for `--dry-run`, and confirms via `confirmBulk`, then uninstalls each target and reports failures together. `--old-versions` uses `NoOptDefVal`, so a bare `major`/`minor`/`all` positional is rejected with a hint to use `=`.
 
 ## 6. Installed-app correlation
 
@@ -196,7 +203,7 @@ Enabled with `--github` on `install`, `upgrade`, `download`, `show`, `list` and 
 `exclude.Load` builds a `*exclude.List` from `WINGET_GO_EXCLUDE` (environment + files), the plain-text lists named by `WINGET_GO_EXCLUDE_FILE`, `--exclude` (repeatable, comma-separated) and `--exclude-file`. `--no-exclude` yields an empty list.
 
 * Patterns are `path.Match` globs, lowercased on both sides, matched against the package Id. The `name:` prefix matches the display name instead. Lists split on `,` `;` and newlines, and `#` starts a comment. Invalid patterns are errors, never silently ignored.
-* They apply to `upgrade` (the table, `--all`, and a named package, which errors with a `--no-exclude` hint), to `list` (the Available column shows `(excluded)`, and `--upgrade-available` hides excluded rows), to `import` (excluded entries are skipped) and to `uninstall --old-versions` (excluded products are never removed). They do not block an explicit `install` or a plain `uninstall`.
+* They apply to `upgrade` (the table, `--all`, and a named package, which errors with a `--no-exclude` hint), to `list` (the Available column shows `(excluded)`, and `--upgrade-available` hides excluded rows), to `import` (excluded entries are skipped) to `uninstall --old-versions` (excluded products are never removed) and to wildcard `uninstall` queries (excluded entries are skipped). They do not block an explicit `install` or an `uninstall` by plain name or Id.
 * `winget-go --info` lists the env files searched, whether each was loaded, and the active patterns with their origin.
 
 ## 9. Platform support

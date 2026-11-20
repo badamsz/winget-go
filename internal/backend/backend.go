@@ -44,6 +44,31 @@ func usesExclusions(args []string) bool {
 	return false
 }
 
+// usesWildcardUninstall reports whether an uninstall query (positional or
+// flag value) is a glob pattern. Native winget would treat "*" literally,
+// so winget-go handles these itself.
+func usesWildcardUninstall(args []string) bool {
+	switch Command(args) {
+	case "uninstall", "remove", "rm":
+	default:
+		return false
+	}
+	for _, a := range args {
+		if a == "--" {
+			break
+		}
+		if i := strings.IndexByte(a, '='); strings.HasPrefix(a, "--") && i > 0 {
+			a = a[i+1:]
+		} else if strings.HasPrefix(a, "-") {
+			continue
+		}
+		if strings.ContainsAny(a, "*?[") {
+			return true
+		}
+	}
+	return false
+}
+
 // Hints carries configuration that influences auto selection.
 type Hints struct {
 	ExclusionsConfigured bool
@@ -126,6 +151,9 @@ func Decide(args []string, find func() string, h Hints) (*Decision, error) {
 		if h.ExclusionsConfigured && usesExclusions(rest) {
 			d.Warning = "exclusion list is ignored by the native winget backend"
 		}
+		if usesWildcardUninstall(rest) {
+			d.Warning = "native winget does not support wildcard uninstall queries; the pattern is matched literally"
+		}
 		return d, nil
 	case Auto:
 	default:
@@ -141,6 +169,10 @@ func Decide(args []string, find func() string, h Hints) (*Decision, error) {
 	}
 	if h.ExclusionsConfigured && usesExclusions(rest) {
 		d.Kind, d.Reason = Portable, "exclusion list applies to `"+Command(rest)+"`"
+		return d, nil
+	}
+	if usesWildcardUninstall(rest) {
+		d.Kind, d.Reason = Portable, "wildcard uninstall is a winget-go feature"
 		return d, nil
 	}
 	if p := find(); p != "" {

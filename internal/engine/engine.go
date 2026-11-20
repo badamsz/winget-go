@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strings"
 
 	"winget-go/internal/config"
@@ -173,18 +174,51 @@ func (e *Engine) Installed() ([]*installed.Item, error) {
 	return installed.List(st, e.Sources)
 }
 
+// HasWildcard reports whether term is a glob pattern (contains *, ? or [).
+func HasWildcard(term string) bool { return strings.ContainsAny(term, "*?[") }
+
 // FindInstalled returns installed items matching a query (by package id,
 // name, or ARP key).
+//
+// A term containing *, ? or [ is a case-insensitive glob (path.Match
+// syntax) that must match the whole Id or the whole display name, e.g.
+// "Microsoft.DotNet.*" or "Python 3.1?.*". Backslashes are literal so
+// ARP ids (ARP\HKLM\...) can be matched as written. Otherwise an exact Id match
+// wins; failing that, names (with exact) or Id/name substrings match.
 func (e *Engine) FindInstalled(term string, exact bool) ([]*installed.Item, error) {
+	t := strings.ToLower(term)
+	glob := HasWildcard(t)
+	if glob {
+		t = globPattern(t)
+		if _, err := path.Match(t, ""); err != nil {
+			return nil, fmt.Errorf("invalid wildcard pattern %q: %w", term, err)
+		}
+	}
 	items, err := e.Installed()
 	if err != nil {
 		return nil, err
 	}
+	return matchInstalled(items, t, exact, glob), nil
+}
+
+// globPattern lowercases a user pattern and makes backslashes literal.
+func globPattern(term string) string {
+	return strings.ReplaceAll(strings.ToLower(term), `\`, `\\`)
+}
+
+func matchInstalled(items []*installed.Item, t string, exact, glob bool) []*installed.Item {
 	var idHits, hits []*installed.Item
-	t := strings.ToLower(term)
 	for _, it := range items {
 		id := strings.ToLower(it.ID())
 		name := strings.ToLower(it.Name)
+		if glob {
+			idOK, _ := path.Match(t, id)
+			nameOK, _ := path.Match(t, name)
+			if idOK || nameOK {
+				hits = append(hits, it)
+			}
+			continue
+		}
 		switch {
 		case id == t:
 			idHits = append(idHits, it)
@@ -195,7 +229,7 @@ func (e *Engine) FindInstalled(term string, exact bool) ([]*installed.Item, erro
 		}
 	}
 	if len(idHits) > 0 {
-		return idHits, nil
+		return idHits
 	}
-	return hits, nil
+	return hits
 }
