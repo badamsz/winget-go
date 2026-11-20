@@ -1,7 +1,10 @@
 package installer
 
 import (
+	"errors"
 	"os"
+	"slices"
+	"strings"
 	"testing"
 
 	"winget-go/internal/manifest"
@@ -107,5 +110,80 @@ func TestUnzipRejectsTraversal(t *testing.T) {
 	}
 	if _, err := safeJoin(t.TempDir(), `bin\tool.exe`); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// pwsh77 mirrors Microsoft.PowerShell 7.7.0.0: one msixbundle listed for
+// three architectures, all marked Windows.Universal.
+const pwsh77 = `PackageIdentifier: Microsoft.PowerShell
+PackageVersion: 7.7.0.0
+PackageName: PowerShell
+Publisher: Microsoft Corporation
+ManifestType: merged
+InstallerType: msix
+Platform:
+- Windows.Universal
+Installers:
+- Architecture: x64
+  InstallerUrl: https://example.invalid/PowerShell-7.7.0.msixbundle
+  InstallerSha256: E00C349858C2D273F29485541ECE91617B435ACCDD5E3F156D68D5CB97740022
+- Architecture: x86
+  InstallerUrl: https://example.invalid/PowerShell-7.7.0.msixbundle
+  InstallerSha256: E00C349858C2D273F29485541ECE91617B435ACCDD5E3F156D68D5CB97740022
+- Architecture: arm64
+  InstallerUrl: https://example.invalid/PowerShell-7.7.0.msixbundle
+  InstallerSha256: E00C349858C2D273F29485541ECE91617B435ACCDD5E3F156D68D5CB97740022
+`
+
+func TestSelectUniversalPlatform(t *testing.T) {
+	m, err := manifest.Parse([]byte(pwsh77))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := Select(m, SelectOptions{Architecture: "x64"})
+	if err != nil {
+		t.Fatalf("Windows.Universal installers must be applicable: %v", err)
+	}
+	if in.Architecture != "x64" {
+		t.Fatalf("arch = %s", in.Architecture)
+	}
+}
+
+func TestSelectInstallTechnology(t *testing.T) {
+	m, _ := manifest.Parse([]byte(pwsh77))
+	// Upgrading an MSI install with an MSIX-only release.
+	_, err := Select(m, SelectOptions{Architecture: "x64", InstalledType: "msi"})
+	var tm *TechMismatchError
+	if !errors.As(err, &tm) || tm.Installed != "msi" || !slices.Equal(tm.Available, []string{"msix"}) {
+		t.Fatalf("expected tech mismatch, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "--installer-type msix") {
+		t.Fatalf("message should suggest --installer-type: %v", err)
+	}
+	// An explicit --installer-type overrides the restriction.
+	if _, err := Select(m, SelectOptions{Architecture: "x64", InstalledType: "msi", InstallerType: "msix"}); err != nil {
+		t.Fatal(err)
+	}
+	// MSIX upgrading MSIX is fine.
+	if _, err := Select(m, SelectOptions{Architecture: "x64", InstalledType: "msix"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 7-Zip ships both exe and wix installers: the installed technology
+	// decides which one an upgrade uses.
+	z := load7zip(t)
+	for installed, want := range map[string]string{"msi": "msi", "wix": "msi", "exe": "exe", "nullsoft": "exe"} {
+		in, err := Select(z, SelectOptions{Architecture: "x64", InstalledType: installed})
+		if err != nil || TechFamily(in.InstallerType) != want {
+			t.Errorf("installed %s: got %v %v", installed, in, err)
+		}
+	}
+}
+
+func TestSelectRejectionReasons(t *testing.T) {
+	m, _ := manifest.Parse([]byte(pwsh77))
+	_, err := Select(m, SelectOptions{Architecture: "x64", Scope: "machine", InstallerType: "msi"})
+	if err == nil || !strings.Contains(err.Error(), "x64/msix (installer type)") || !strings.Contains(err.Error(), "arm64/msix (architecture)") {
+		t.Fatalf("expected per-installer reasons, got %v", err)
 	}
 }

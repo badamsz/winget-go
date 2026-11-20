@@ -37,6 +37,33 @@ type Request struct {
 	Force            bool
 	Upgrade          bool
 	DownloadDir      string // download command only
+	// Installed is the copy being upgraded, if known. Its install
+	// technology restricts which installers may be used (see
+	// installer.SelectOptions.InstalledType).
+	Installed *installed.Item
+	// Migrate allows an upgrade to switch install technology (e.g. MSI →
+	// MSIX) when the new version has no installer of the current one:
+	// the old copy is uninstalled and the new one installed fresh.
+	Migrate bool
+}
+
+// InstalledTech returns the install technology of an installed item:
+// from winget-go's record, MSIX registration, or the ARP entry (Windows
+// Installer products). It returns "" when unknown (e.g. a plain exe
+// uninstaller), which leaves installer selection unrestricted.
+func InstalledTech(it *installed.Item) string {
+	switch {
+	case it == nil:
+		return ""
+	case it.Record != nil && it.Record.InstallerType != "":
+		return it.Record.InstallerType
+	case it.MSIX != nil:
+		return "msix"
+	case it.ARP != nil && (it.ARP.WindowsInstaller ||
+		strings.HasPrefix(it.ARP.KeyName, "{") && strings.Contains(strings.ToLower(it.ARP.UninstallString), "msiexec")):
+		return "msi"
+	}
+	return ""
 }
 
 // Plan is a resolved manifest + installer (+ optional GitHub override).
@@ -46,6 +73,26 @@ type Plan struct {
 	Installer manifest.Installer
 	Version   string // version that will be installed
 	GitHub    *github.Override
+	// MigrateFrom is set (to the installed technology family) when the
+	// upgrade switches install technology; see Request.Migrate.
+	MigrateFrom string
+}
+
+// selectForUpgrade picks an installer, restricted to the installed
+// technology when known. With migrate, a TechMismatchError is retried
+// without the restriction and the old technology is returned in
+// migrateFrom. An installer of the current technology always wins.
+func selectForUpgrade(m *manifest.Manifest, sel installer.SelectOptions, migrate bool) (in *manifest.Installer, migrateFrom string, err error) {
+	in, err = installer.Select(m, sel)
+	var tm *installer.TechMismatchError
+	if !migrate || !errors.As(err, &tm) {
+		return in, "", err
+	}
+	sel.InstalledType = ""
+	if in, err = installer.Select(m, sel); err != nil {
+		return nil, "", err
+	}
+	return in, tm.Installed, nil
 }
 
 // Plan resolves what would be installed.
@@ -56,11 +103,14 @@ func (e *Engine) Plan(ctx context.Context, r *Request) (*Plan, error) {
 	}
 	sel := r.Select
 	sel.PreferMachine = platform.IsElevated()
-	in, err := installer.Select(m, sel)
+	if r.Upgrade && sel.InstalledType == "" {
+		sel.InstalledType = InstalledTech(r.Installed)
+	}
+	in, migrateFrom, err := selectForUpgrade(m, sel, r.Migrate && r.Upgrade && r.Installed != nil)
 	if err != nil {
 		return nil, err
 	}
-	p := &Plan{Manifest: m, Raw: raw, Installer: *in, Version: m.PackageVersion}
+	p := &Plan{Manifest: m, Raw: raw, Installer: *in, Version: m.PackageVersion, MigrateFrom: migrateFrom}
 	if e.GitHub && r.Version == "" {
 		o, err := github.Check(ctx, m, in)
 		switch {
@@ -243,7 +293,16 @@ func (e *Engine) install(ctx context.Context, r *Request, visiting map[string]bo
 	if err != nil {
 		return err
 	}
-	if r.Upgrade && strings.EqualFold(p.Installer.UpgradeBehavior, "uninstallPrevious") {
+	migrating := p.MigrateFrom != ""
+	if migrating {
+		// The new installer is downloaded and verified at this point, so
+		// the old copy is only removed once we know we can install.
+		fmt.Fprintf(e.Out, "Migrating %s from %s to %s: uninstalling %s first...\n",
+			r.Installed.Name, strings.ToUpper(p.MigrateFrom), strings.ToUpper(installer.TechFamily(p.Installer.InstallerType)), r.Installed.Label())
+		if err := e.Uninstall(ctx, r.Installed, UninstallOptions{Mode: installer.ModeSilent}); err != nil {
+			return fmt.Errorf("uninstall the %s copy before migrating: %w (nothing was changed)", strings.ToUpper(p.MigrateFrom), err)
+		}
+	} else if r.Upgrade && strings.EqualFold(p.Installer.UpgradeBehavior, "uninstallPrevious") {
 		if items, _ := e.FindInstalled(r.Package.ID, true); len(items) == 1 {
 			fmt.Fprintln(e.Out, "Uninstalling previous version...")
 			if err := e.Uninstall(ctx, items[0], UninstallOptions{Mode: installer.ModeSilent}); err != nil {
@@ -269,10 +328,14 @@ func (e *Engine) install(ctx context.Context, r *Request, visiting map[string]bo
 		Commands:  p.Installer.Commands,
 		Args: installer.ArgOptions{
 			Mode: r.Mode, Scope: r.Select.Scope, InstallLocation: r.Location,
-			LogPath: logPath, Override: r.Override, Custom: r.Custom, Upgrade: r.Upgrade,
+			LogPath: logPath, Override: r.Override, Custom: r.Custom, Upgrade: r.Upgrade && !migrating,
 		},
 	})
 	if err != nil {
+		if migrating {
+			return fmt.Errorf("%w; the old %s copy was already uninstalled. The verified installer is %s; retry with: winget-go install --id %s -e",
+				err, strings.ToUpper(p.MigrateFrom), file, r.Package.ID)
+		}
 		return err
 	}
 	rec := &installed.Record{
@@ -285,7 +348,7 @@ func (e *Engine) install(ctx context.Context, r *Request, visiting map[string]bo
 	if t := strings.ToLower(p.Installer.InstallerType); t == "zip" && p.Installer.NestedInstallerType != "" {
 		rec.InstallerType = "zip/" + strings.ToLower(p.Installer.NestedInstallerType)
 	}
-	if old := st.Get(r.Package.ID); old != nil && len(old.ARPKeys) > 0 && res.InstallLocation == "" {
+	if old := st.Get(r.Package.ID); !migrating && old != nil && len(old.ARPKeys) > 0 && res.InstallLocation == "" {
 		rec.ARPKeys = old.ARPKeys
 	}
 	if diff := installed.Diff(before, installed.Snapshot()); len(diff) > 0 {

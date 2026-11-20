@@ -58,6 +58,17 @@ winget-go upgrade --github                    # include GitHub releases in upgra
 
 The installer hash comes from GitHub's published asset digest. If GitHub has no digest for an asset, winget-go refuses to install it unless you pass `--ignore-security-hash`. Set `GITHUB_TOKEN` to raise the API rate limit.
 
+### Changing install technology
+
+An upgrade keeps the technology of the installed copy (MSI, MSIX, EXE-style or portable), as native winget does. Sometimes a publisher switches technology. For example, PowerShell 7.7 ships only as an MSIX, while 7.6 was an MSI. Installing the MSIX would just put a second copy beside the old one, so the upgrade stops and explains why. To switch anyway:
+
+```sh
+winget-go upgrade Microsoft.PowerShell --migrate   # uninstall the MSI, install the MSIX
+winget-go upgrade --all --migrate
+```
+
+The new installer is downloaded and its hash checked before anything is removed. Then the old copy is uninstalled and the new version installed. If that final install fails, winget-go tells you the old copy is already gone and prints the downloaded installer's path and the command to retry. To keep both copies instead, use `--installer-type msix`.
+
 ### Uninstalling with wildcards
 
 `uninstall` accepts a wildcard pattern (`*`, `?`, `[...]`, case-insensitive). The pattern must match the whole package Id or the whole display name:

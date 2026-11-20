@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 
@@ -18,6 +19,42 @@ type SelectOptions struct {
 	Locale        string // e.g. en-US ("" = system preference)
 	InstallerType string // e.g. msi, exe, portable ("" = any)
 	PreferMachine bool   // prefer machine scope (e.g. when elevated)
+	// InstalledType is the technology of the copy being upgraded (msi,
+	// msix, exe, portable, …; "" = unknown). Unless InstallerType is set,
+	// only installers of a compatible technology are considered, because
+	// e.g. an MSIX does not replace an MSI install; it lands beside it.
+	InstalledType string
+}
+
+// TechFamily groups installer types that upgrade each other in place:
+// "msi" (msi, wix), "msix" (msix, appx), "portable" (portable, zip with
+// portable files) and "exe" (exe, inno, nullsoft, burn). Unknown types
+// return "".
+func TechFamily(t string) string {
+	switch strings.ToLower(t) {
+	case "msi", "wix":
+		return "msi"
+	case "msix", "appx":
+		return "msix"
+	case "portable", "zip/portable":
+		return "portable"
+	case "exe", "inno", "nullsoft", "burn":
+		return "exe"
+	}
+	return ""
+}
+
+// TechMismatchError means newer installers exist, but only for a
+// different install technology than the installed copy.
+type TechMismatchError struct {
+	Installed string   // technology family of the installed copy
+	Available []string // installer types that were applicable otherwise
+}
+
+func (e *TechMismatchError) Error() string {
+	return fmt.Sprintf("the new version is only available as %s, but the installed copy is a %s install; "+
+		"pass --migrate to uninstall it and install the new version, or --installer-type %s to install the new version alongside it",
+		strings.Join(e.Available, "/"), strings.ToUpper(e.Installed), e.Available[0])
 }
 
 // SystemArchitectures returns the architectures this machine can run, in
@@ -78,24 +115,44 @@ func Select(m *manifest.Manifest, o SelectOptions) (*manifest.Installer, error) 
 	}
 	var cands []cand
 	var rejected []string
+	reject := func(in *manifest.Installer, why string) {
+		rejected = append(rejected, fmt.Sprintf("%s/%s (%s)", in.Architecture, effectiveType(in), why))
+	}
+	installedFamily := ""
+	if o.InstallerType == "" {
+		installedFamily = TechFamily(o.InstalledType)
+	}
+	var otherTech []string
 	for i := range m.Installers {
 		in := &m.Installers[i]
 		ar, ok := archRank[strings.ToLower(in.Architecture)]
 		if !ok {
-			rejected = append(rejected, in.Architecture+"/"+in.InstallerType)
+			reject(in, "architecture")
 			continue
 		}
 		if o.Scope != "" && in.Scope != "" && !strings.EqualFold(in.Scope, o.Scope) {
+			reject(in, "scope "+in.Scope)
 			continue
 		}
 		if o.InstallerType != "" && !strings.EqualFold(effectiveType(in), o.InstallerType) && !strings.EqualFold(in.InstallerType, o.InstallerType) {
+			reject(in, "installer type")
 			continue
 		}
-		if !desktopPlatform(in.Platform) {
+		if !windowsPlatform(in.Platform) {
+			reject(in, "platform "+strings.Join(in.Platform, ","))
 			continue
 		}
 		if o.Locale != "" && in.InstallerLocale != "" && lang(in.InstallerLocale) != lang(o.Locale) {
+			reject(in, "locale "+in.InstallerLocale)
 			continue
+		}
+		if installedFamily != "" {
+			if f := TechFamily(effectiveType(in)); f != "" && f != installedFamily {
+				if t := effectiveType(in); !slices.Contains(otherTech, t) {
+					otherTech = append(otherTech, t)
+				}
+				continue
+			}
 		}
 		locRank := 2
 		switch {
@@ -121,9 +178,12 @@ func Select(m *manifest.Manifest, o SelectOptions) (*manifest.Installer, error) 
 		cands = append(cands, cand{in: in, score: [4]int{storeRank, ar, locRank, scopeRank}, order: i})
 	}
 	if len(cands) == 0 {
+		if len(otherTech) > 0 {
+			return nil, &TechMismatchError{Installed: installedFamily, Available: otherTech}
+		}
 		msg := "no applicable installer found"
 		if len(rejected) > 0 {
-			msg += fmt.Sprintf(" for architectures %v (available: %s)", archs, strings.Join(rejected, ", "))
+			msg += fmt.Sprintf(" for %s; rejected: %s", strings.Join(archs, "/"), strings.Join(rejected, ", "))
 		}
 		return nil, fmt.Errorf("%s; try --architecture, --scope, --locale or --installer-type", msg)
 	}
@@ -143,12 +203,16 @@ func Select(m *manifest.Manifest, o SelectOptions) (*manifest.Installer, error) 
 	return best, nil
 }
 
-func desktopPlatform(p []string) bool {
+// windowsPlatform reports whether an installer targets desktop Windows.
+// Windows.Universal (UWP/MSIX) packages run on desktop too, as in winget;
+// only an explicit list without either value (e.g. a future platform) is
+// rejected.
+func windowsPlatform(p []string) bool {
 	if len(p) == 0 {
 		return true
 	}
 	for _, v := range p {
-		if strings.EqualFold(v, "Windows.Desktop") {
+		if strings.EqualFold(v, "Windows.Desktop") || strings.EqualFold(v, "Windows.Universal") {
 			return true
 		}
 	}

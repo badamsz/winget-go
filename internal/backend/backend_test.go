@@ -61,6 +61,9 @@ func TestDecide(t *testing.T) {
 	if d, _ := Decide([]string{"uninstall", "--old-versions=minor"}, found, Hints{}); d.Kind != Portable {
 		t.Fatalf("--old-versions is a winget-go flag: %+v", d)
 	}
+	if d, _ := Decide([]string{"upgrade", "--all", "--migrate"}, found, Hints{}); d.Kind != Portable {
+		t.Fatalf("--migrate is a winget-go flag: %+v", d)
+	}
 	for _, args := range [][]string{
 		{"uninstall", "Microsoft.DotNet.*"},
 		{"rm", "--id", "Python.Python.3.1?"},

@@ -24,6 +24,19 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
+// isLocalSystem reports whether the process runs as NT AUTHORITY\SYSTEM.
+func isLocalSystem() bool {
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return false
+	}
+	sys, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		return false
+	}
+	return windows.EqualSid(u.User.Sid, sys)
+}
+
 // IsElevated reports whether the process token is elevated.
 func IsElevated() bool {
 	return windows.GetCurrentProcessToken().IsElevated()
@@ -218,9 +231,8 @@ func AddToUserPath(dir string) (bool, error) {
 }
 
 // FindNativeWinget locates winget.exe: on PATH, via the App Execution
-// Alias, or inside the App Installer package (needed when running as
-// SYSTEM, where the alias is not available). It never returns the
-// current executable.
+// Alias, or (as SYSTEM only, where no alias exists) inside the App
+// Installer package directory. It never returns the current executable.
 func FindNativeWinget() string {
 	self, _ := os.Executable()
 	var cands []string
@@ -234,7 +246,12 @@ func FindNativeWinget() string {
 	if pf == "" {
 		pf = os.Getenv("ProgramFiles")
 	}
-	if pf != "" {
+	// Executing from the package directory only works for LocalSystem.
+	// Any other account (including an elevated admin for whom App
+	// Installer was never registered) gets "Access is denied"; those
+	// accounts reach winget through the App Execution Alias above, or
+	// have no usable winget at all.
+	if pf != "" && isLocalSystem() {
 		matches, _ := filepath.Glob(filepath.Join(pf, "WindowsApps", "Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe", "winget.exe"))
 		sort.Sort(sort.Reverse(sort.StringSlice(matches))) // newest version first
 		cands = append(cands, matches...)

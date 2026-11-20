@@ -148,10 +148,18 @@ func downloadCmd(o Options) *cobra.Command {
 func upgradeCmd(o Options) *cobra.Command {
 	var f installFlags
 	var ex excludeFlags
-	var all, includeUnknown bool
+	var all, includeUnknown, migrate bool
 	cmd := &cobra.Command{
 		Use: "upgrade [query]", Aliases: []string{"update"},
 		Short: "Shows and performs available upgrades",
+		Long: `Shows and performs available upgrades.
+
+An upgrade keeps the install technology of the installed copy (MSI, MSIX,
+EXE-style or portable). If a new version is only published for a different
+technology (e.g. PowerShell moving from MSI to MSIX), the upgrade stops and
+explains why. Pass --migrate to switch technology: the new installer is
+downloaded and verified first, then the old copy is uninstalled and the new
+version installed.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			e, err := openEngine(ctx, o, f.source)
@@ -224,6 +232,8 @@ func upgradeCmd(o Options) *cobra.Command {
 			for _, u := range targets {
 				r := f.request(u.Item.Package)
 				r.Upgrade = true
+				r.Installed = u.Item
+				r.Migrate = migrate
 				r.Force = true // Upgrades() already established a newer version exists
 				if err := e.Install(ctx, r); err != nil {
 					fmt.Fprintf(o.Stderr, "%s: %v\n", u.Item.ID(), err)
@@ -240,6 +250,8 @@ func upgradeCmd(o Options) *cobra.Command {
 	cmd.Flags().BoolVarP(&all, "all", "r", false, "Upgrade all installed packages to latest if available")
 	cmd.Flags().Bool("recurse", false, "Alias of --all")
 	cmd.Flags().BoolVarP(&includeUnknown, "include-unknown", "u", false, "Upgrade packages even if their current version cannot be determined")
+	cmd.Flags().BoolVar(&migrate, "migrate", false,
+		"If the new version uses a different install technology (e.g. MSI to MSIX), uninstall the old copy and install the new one")
 	ex.register(cmd)
 	cmd.PreRun = func(cmd *cobra.Command, args []string) {
 		if v, _ := cmd.Flags().GetBool("recurse"); v {

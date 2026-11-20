@@ -23,7 +23,7 @@ const (
 
 // goOnlyFlags only exist in winget-go; their presence forces the
 // portable backend in auto mode.
-var goOnlyFlags = []string{"--github", "--exclude", "--exclude-file", "--no-exclude", "--old-versions", "--keep", "--dry-run"}
+var goOnlyFlags = []string{"--github", "--exclude", "--exclude-file", "--no-exclude", "--old-versions", "--keep", "--dry-run", "--migrate"}
 
 // Commands that honour exclusion lists run on the portable backend in
 // auto mode when exclusions are configured, because native winget knows

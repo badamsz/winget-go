@@ -26,7 +26,7 @@ flowchart TD
     B -- native --> N{winget.exe found?}
     N -- yes --> X[exec winget.exe args]
     N -- no --> E[error]
-    B -- auto/unset --> G{winget-go-only flag?<br/>--github, --exclude, --old-versions ...}
+    B -- auto/unset --> G{winget-go-only flag?<br/>--github, --exclude, --old-versions, --migrate ...}
     G -- yes --> P
     G -- no --> XC{exclusions configured and<br/>upgrade / import / list --upgrade-available?}
     XC -- yes --> P
@@ -40,7 +40,7 @@ flowchart TD
 
 * Implemented in [`internal/backend`](../internal/backend) and [`cmd/winget-go/main.go`](../cmd/winget-go/main.go).
 * `--backend` is stripped before the remaining args are passed through **verbatim** to native winget, which keeps stdio and the exit code.
-* Native winget discovery ([`platform.FindNativeWinget`](../internal/platform/platform_windows.go)) checks `PATH`, the App Execution Alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`, then `%ProgramFiles%\WindowsApps\Microsoft.DesktopAppInstaller_*` (needed under `SYSTEM`). It never returns its own executable, so it is safe to install winget-go as `winget.exe`.
+* Native winget discovery ([`platform.FindNativeWinget`](../internal/platform/platform_windows.go)) checks `PATH`, the App Execution Alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`, then, **only when running as `SYSTEM`**, `%ProgramFiles%\WindowsApps\Microsoft.DesktopAppInstaller_*`. Any other account gets "Access is denied" executing from there. That includes an elevated admin for whom App Installer was never registered: such an account has no alias and uses the portable backend. If native winget is found but fails to start, `main` warns (naming the path and the OS reason, and suggesting `WINGET_GO_BACKEND=portable`) and falls back to the portable backend. It never returns its own executable, so it is safe to install winget-go as `winget.exe`.
 * Env files (§8) are loaded **before** the decision, because they may set `WINGET_GO_BACKEND` or exclusions.
 * Native winget has no exclusion support. When exclusions are configured, commands that honour them run on the portable backend in auto mode. An explicit `--backend native` gets a warning that the exclusions are ignored.
 * Native winget treats `*` in a query literally, so an `uninstall`/`remove`/`rm` whose positional query or flag value contains `*`, `?` or `[` runs on the portable backend in auto mode. An explicit `--backend native` gets a warning.
@@ -112,7 +112,7 @@ flowchart LR
     SNAP2 --> ST[Write installed.json record]
 ```
 
-**Installer selection** (`installer.Select`): filter by architecture (system preference order, e.g. arm64 → x64 → x86 → neutral on ARM64; `-a` forces one), `--scope`, `--installer-type`, `--installer-locale` and the `Windows.Desktop` platform. Then rank by: not-Store, architecture preference, locale match (`LANG`/`WINGET_GO_LOCALE`), and scope preference (machine when elevated, user otherwise). On non-Windows hosts the target is assumed to be Windows x64.
+**Installer selection** (`installer.Select`): filter by architecture (system preference order, e.g. arm64 → x64 → x86 → neutral on ARM64; `-a` forces one), `--scope`, `--installer-type`, `--installer-locale` and platform (`Windows.Desktop` or `Windows.Universal`; MSIX packages such as PowerShell 7.7 are Universal-only). When nothing is left, the error lists each installer with the reason it was rejected. Then rank by: not-Store, architecture preference, locale match (`LANG`/`WINGET_GO_LOCALE`), and scope preference (machine when elevated, user otherwise). On non-Windows hosts the target is assumed to be Windows x64.
 
 **Arguments** (`installer.BuildArgs`): manifest switches override winget's built-in defaults per technology:
 
@@ -141,6 +141,16 @@ Order: mode → log → scope (`/CURRENTUSER`/`/ALLUSERS` for Inno, `ALLUSERS`/`
 **Portable links**: a symlink `<alias>.exe` is created when permitted (admin or Developer Mode); otherwise a `<alias>.cmd` shim is written. `<data>\Links`, or the install directory when `ArchiveBinariesDependOnPath` is set, is appended to the user `PATH` (`HKCU\Environment`), and `WM_SETTINGCHANGE` is broadcast.
 
 **Exit codes**: `0`, `3010` and `1641` (reboot) count as success, as does anything listed in `InstallerSuccessCodes`. Other codes are explained with `ExpectedReturnCodes` and well-known MSI codes.
+
+**Install technology on upgrade**: `upgrade` passes the installed item, and `engine.InstalledTech` derives its technology from the winget-go record, MSIX registration or ARP (`WindowsInstaller` / msiexec uninstall → msi). Unless `--installer-type` is given, `installer.Select` then only considers installers of the same `TechFamily`: msi (msi, wix), msix (msix, appx), exe (exe, inno, nullsoft, burn) or portable. This is because an MSIX does not replace an MSI install; it lands beside it. If only other technologies are available, it returns `TechMismatchError` ("only available as msix, but the installed copy is an MSI install; pass --migrate … or --installer-type msix …"), as native winget does. Unknown technology (plain exe uninstallers) is unrestricted.
+
+**Technology migration** (`upgrade --migrate`, `Request.Migrate`): `engine.selectForUpgrade` retries a `TechMismatchError` without the restriction and records the old family in `Plan.MigrateFrom`. An installer of the current technology still wins when one exists. `install` then:
+
+1. Downloads and hash-verifies the new installer.
+2. Uninstalls the old copy (`Request.Installed`) silently. If this fails, nothing has changed.
+3. Runs the new installer as a fresh install (`ArgOptions.Upgrade` is false) and does not carry over the old record's ARP keys.
+
+If step 3 fails, the error says the old copy is already gone and gives the verified installer's path and an `install --id … -e` retry command. `--migrate` is a winget-go flag, so it forces the portable backend.
 
 **Upgrade** (`engine.Upgrades`): installed items whose matched package has a higher `latest_version` (or a newer GitHub release with `--github`). Each result carries `ExcludedBy` when it matches the exclusion list (§8); excluded packages skip the GitHub lookup. `UpgradeBehavior: uninstallPrevious` uninstalls first; `deny` refuses.
 
