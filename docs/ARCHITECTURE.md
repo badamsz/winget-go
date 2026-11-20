@@ -1,0 +1,249 @@
+# winget-go Architecture
+
+> **Keep this document current.** Any change that adds, removes or reshapes a
+> package, command, backend, on-disk format or data flow must update the
+> relevant section here in the same commit. See [Maintaining this document](#maintaining-this-document).
+
+## 1. Goals
+
+winget-go is a Go implementation of the [winget](https://github.com/microsoft/winget-cli) client that:
+
+1. **Delegates to native winget** when it is available on Windows, so behaviour is identical to winget there.
+2. **Works without winget**, e.g. on Windows Server / LTSC / Windows Sandbox / Server Core, under `SYSTEM`, or wherever App Installer is missing or broken. It reads the same community source as winget and installs packages itself.
+3. **Runs on macOS and Linux** for read-only and staging tasks (`search`, `show`, `download`, `hash`, `source`), e.g. to prepare offline installers.
+4. **Optionally uses GitHub Releases** to pick up newer versions of GitHub-hosted packages before their winget manifests are updated.
+5. **Supports exclusion lists** (configured once in a `winget-go.env` file) so bulk upgrades and imports skip packages that are pinned or managed elsewhere.
+
+It is a single static binary (`CGO_ENABLED=0`; SQLite is provided by the pure-Go `modernc.org/sqlite`).
+
+## 2. Backend selection
+
+```mermaid
+flowchart TD
+    S[load winget-go.env files] --> A
+    A[winget-go args] --> B{--backend / WINGET_GO_BACKEND}
+    B -- portable --> P[Go engine]
+    B -- native --> N{winget.exe found?}
+    N -- yes --> X[exec winget.exe args]
+    N -- no --> E[error]
+    B -- auto/unset --> G{winget-go-only flag?<br/>--github, --exclude, --no-exclude ...}
+    G -- yes --> P
+    G -- no --> XC{exclusions configured and<br/>upgrade / import / list --upgrade-available?}
+    XC -- yes --> P
+    XC -- no --> F{winget.exe found?}
+    F -- yes --> X
+    F -- no --> P
+    X -- failed to start --> P
+```
+
+* Implemented in [`internal/backend`](../internal/backend) and [`cmd/winget-go/main.go`](../cmd/winget-go/main.go).
+* `--backend` is stripped before the remaining args are passed through **verbatim** to native winget, which keeps stdio and the exit code.
+* Native winget discovery ([`platform.FindNativeWinget`](../internal/platform/platform_windows.go)) checks `PATH`, the App Execution Alias in `%LOCALAPPDATA%\Microsoft\WindowsApps`, then `%ProgramFiles%\WindowsApps\Microsoft.DesktopAppInstaller_*` (needed under `SYSTEM`). It never returns its own executable, so it is safe to install winget-go as `winget.exe`.
+* Env files (§8) are loaded **before** the decision, because they may set `WINGET_GO_BACKEND` or exclusions.
+* Native winget has no exclusion support. When exclusions are configured, commands that honour them run on the portable backend in auto mode. An explicit `--backend native` gets a warning that the exclusions are ignored.
+* `WINGET_GO_DEBUG=1` prints the decision; `winget-go --info` (portable backend) shows it too.
+
+## 3. Package map
+
+| Package | Responsibility |
+|---|---|
+| `cmd/winget-go` | Entry point: backend decision, passthrough, signal handling, exit codes. |
+| `internal/backend` | `auto` / `native` / `portable` resolution and native passthrough. |
+| `internal/cli` | Cobra command tree that mirrors winget's commands and flags (`-h` = `--silent`, so help is `--help`). Renders winget-style tables. |
+| `internal/engine` | The portable backend's operations: resolve, plan, download, install, upgrade, uninstall, export/import. Coordinates every package below. |
+| `internal/source` | Pre-indexed source v2: index download/extract, SQLite queries, version data, manifest fetch and verification, ARP name normalization. |
+| `internal/mszyml` | Decoder for `.mszyml` (Windows Compression API buffer with MSZIP blocks). |
+| `internal/manifest` | Merged-manifest model, root-to-installer default merging, localization overlay. |
+| `internal/installer` | Installer selection, default switches per technology, argument building, exit codes, execution, portable/zip installs, uninstall command parsing. |
+| `internal/installed` | winget-go install records (`installed.json`), ARP snapshots/diffs, correlation of installed apps to packages. |
+| `internal/github` | GitHub Releases lookup, asset matching, digest-based hashes, response cache. |
+| `internal/platform` | OS boundary: process launch + UAC elevation (`ShellExecuteExW runas`), ARP registry enumeration, user `PATH` edits, native winget discovery. Off Windows, these are stubs. |
+| `internal/httpx` | Shared HTTP client, User-Agent, streaming download with progress and SHA-256. |
+| `internal/config` | On-disk locations, `sources.json`, environment settings, `winget-go.env` discovery/parsing, version string. |
+| `internal/exclude` | Exclusion lists: pattern parsing (globs on Id, `name:` globs on display name), loading from env/env files/flags/list files, matching. |
+| `internal/version` | winget-compatible version comparison. |
+
+Dependency direction: `cli → engine → {source, installer, installed, github, exclude} → {manifest, platform, httpx, config, version, mszyml}`. `platform` imports nothing internal, which keeps the OS-specific surface small.
+
+## 4. The winget community source (format v2)
+
+winget-go uses the same CDN as winget, `https://cdn.winget.microsoft.com/cache`:
+
+```mermaid
+sequenceDiagram
+    participant C as winget-go
+    participant CDN as cdn.winget.microsoft.com/cache
+    C->>CDN: GET /source2.msix (If-None-Match / If-Modified-Since)
+    CDN-->>C: MSIX (zip) containing Public/index.db
+    Note over C: SQLite: packages, tags2, commands2,<br/>productcodes2, norm_names2, norm_publishers2 ...
+    C->>CDN: GET /packages/{Id}/{hash[0:8]}/versionData.mszyml
+    CDN-->>C: MSZIP-compressed YAML {sV, vD: [{v, rP, s256H}]}
+    C->>CDN: GET /{rP}   (e.g. manifests/7/7zip/7zip/26.06/67fd)
+    CDN-->>C: merged manifest YAML (SHA-256 must equal s256H)
+```
+
+* **Index**: `packages(rowid, id, name, moniker, latest_version, arp_min_version, arp_max_version, hash)` plus `*2` mapping tables. The schema `majorVersion` must be `2`.
+* **Version data**: the `packages.hash` column (SHA-256) makes the URL content-addressed, so cached version data stays valid until the hash changes.
+* **`.mszyml`**: 24-byte header (`0A 51 E5 C0` signature, uncompressed size, chunk size), followed by blocks of `uint32 size` + `"CK"` + raw DEFLATE. Each block uses the previous block's output as its preset dictionary.
+* **Manifests** are *merged* (version + locales + installers in one YAML file). Root-level installer fields (`Scope`, `InstallerType`, `InstallerSwitches`, …) act as defaults for every installer; `manifest.Parse` merges them, and switches are merged key by key. Locales live under `Localization`.
+* **Refresh**: the index is refreshed when it is older than `WINGET_GO_AUTOUPDATE_MINUTES` (default 15). Requests are conditional, so an unchanged index costs one 304. If a refresh fails but a cached index exists, winget-go warns and continues.
+
+Search runs one SQL query per field (id, name, moniker, tag, command) with escaped `LIKE` patterns, or `= COLLATE NOCASE` for `--exact`. It ranks results by match type (exact → case-insensitive → prefix → substring), then by field. `install`/`show`/`download` search only id, name and moniker, like winget, and `Resolve` prefers a case-insensitive exact id match.
+
+Additional sources of type `Microsoft.PreIndexed.Package` can be added with `source add`. REST sources and the `msstore` source are not supported.
+
+## 5. Install pipeline (portable backend)
+
+```mermaid
+flowchart LR
+    R[Resolve query] --> PL[Plan: manifest + Select installer]
+    PL --> GH{--github?}
+    GH -- newer release --> OV[Override URL/SHA from release asset]
+    GH -- no --> AG
+    OV --> AG[Agreements prompt]
+    AG --> DEP[Package dependencies<br/>recursive, cycle-safe]
+    DEP --> DL[Download + SHA-256 verify<br/>cache reuse]
+    DL --> SNAP1[ARP snapshot]
+    SNAP1 --> EX[Execute by installer type]
+    EX --> SNAP2[ARP snapshot + diff]
+    SNAP2 --> ST[Write installed.json record]
+```
+
+**Installer selection** (`installer.Select`): filter by architecture (system preference order, e.g. arm64 → x64 → x86 → neutral on ARM64; `-a` forces one), `--scope`, `--installer-type`, `--installer-locale` and the `Windows.Desktop` platform. Then rank by: not-Store, architecture preference, locale match (`LANG`/`WINGET_GO_LOCALE`), and scope preference (machine when elevated, user otherwise). On non-Windows hosts the target is assumed to be Windows x64.
+
+**Arguments** (`installer.BuildArgs`): manifest switches override winget's built-in defaults per technology:
+
+| Type | Silent | Silent with progress | Log | Location |
+|---|---|---|---|---|
+| msi / wix | `/quiet /norestart` | `/passive /norestart` | `/log "<LOGPATH>"` | `TARGETDIR=… INSTALLDIR=…` |
+| burn | `/quiet /norestart` | `/passive /norestart` | `/log "<LOGPATH>"` | – |
+| nullsoft | `/S` | `/S` | – | `/D=<path>` (always last) |
+| inno | `/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART` | `/SP- /SILENT …` | `/LOG="<LOGPATH>"` | `/DIR="<path>"` |
+| exe | manifest only | manifest only | manifest only | manifest only |
+
+Order: mode → log → scope (`/CURRENTUSER`/`/ALLUSERS` for Inno, `ALLUSERS`/`MSIINSTALLPERUSER` for MSI) → `Upgrade` (on upgrade) → manifest `Custom` → `--custom` → location. `--override` replaces everything.
+
+**Execution** (`installer.Execute`, Windows only):
+
+| Type | How |
+|---|---|
+| msi / wix | `%SystemRoot%\System32\msiexec.exe /i "<file>" <args>` |
+| msix / appx | PowerShell `Add-AppxPackage` (`Add-AppxProvisionedPackage` for `--scope machine`) |
+| exe / inno / nullsoft / burn | The file itself, with a raw command line (`SysProcAttr.CmdLine`) so switches such as `/D=C:\Program Files\X` are not re-quoted |
+| portable | Copy to `<data>\Packages\<Id>\<alias>.exe`, then link it into `<data>\Links` |
+| zip | Extract with zip-slip protection, then either install as portable (`NestedInstallerType: portable`, all `NestedInstallerFiles` get links) or run the first nested installer |
+
+**Elevation**: UAC (`ShellExecuteExW` with `runas`, waiting on the process handle) is used when the process is not elevated and either the manifest says `elevationRequired`, or it is an MSI/WiX machine-scope install. It is also used as a retry whenever Windows returns `ERROR_ELEVATION_REQUIRED` (740). `elevatesSelf` / `elevationProhibited` are respected.
+
+**Portable links**: a symlink `<alias>.exe` is created when permitted (admin or Developer Mode); otherwise a `<alias>.cmd` shim is written. `<data>\Links`, or the install directory when `ArchiveBinariesDependOnPath` is set, is appended to the user `PATH` (`HKCU\Environment`), and `WM_SETTINGCHANGE` is broadcast.
+
+**Exit codes**: `0`, `3010` and `1641` (reboot) count as success, as does anything listed in `InstallerSuccessCodes`. Other codes are explained with `ExpectedReturnCodes` and well-known MSI codes.
+
+**Upgrade** (`engine.Upgrades`): installed items whose matched package has a higher `latest_version` (or a newer GitHub release with `--github`). Each result carries `ExcludedBy` when it matches the exclusion list (§8); excluded packages skip the GitHub lookup. `UpgradeBehavior: uninstallPrevious` uninstalls first; `deny` refuses.
+
+**Uninstall**: portable records → delete links and directory. ARP entries → `msiexec /x {ProductCode}` for Windows Installer products; otherwise `QuietUninstallString`; otherwise `UninstallString` plus technology-specific silent switches (based on the recorded or manifest installer type).
+
+## 6. Installed-app correlation
+
+`installed.List` merges:
+
+1. **ARP entries** from `HKLM` (64-bit and 32-bit views) and `HKCU` `…\CurrentVersion\Uninstall`. System components and updates are skipped.
+2. **winget-go records** (`installed.json`). Each install snapshots ARP before and after running the installer and stores the keys that changed. This is the same technique winget uses, and it gives an exact package↔ARP mapping for anything winget-go installed.
+3. For other ARP entries, matching falls back to **product code** (`productcodes2`, lowercased key name) and then to **normalized name** (`norm_names2`). Ties are broken by **normalized publisher** (`norm_publishers2`). `source.NormalizeName` approximates winget's `NameNormalizer`: it strips versions, locales and parentheticals, and emits arch-suffixed variants such as `mozillafirefox(X64)`.
+4. **Portable records** that have no ARP entry.
+
+MSIX packages (`Get-AppxPackage`) are not enumerated yet.
+
+## 7. GitHub Releases integration
+
+Enabled with `--github` on `install`, `upgrade`, `download`, `show`, `list` and `import`, or globally with `WINGET_GO_GITHUB=1`. In `auto` mode, `--github` forces the portable backend.
+
+1. An installer qualifies when its URL is `https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>`.
+2. winget-go calls `GET /repos/<owner>/<repo>/releases/latest`. Drafts and prereleases are ignored. Responses are cached for an hour in `<cache>/github`, then revalidated with `ETag` (a 304 does not count against the rate limit). `GITHUB_TOKEN`/`GH_TOKEN` raises the limit and is sent only to `api.github.com`.
+3. The release is used only if its tag version (leading non-digits stripped: `v1.2`, `jq-1.8` → `1.2`, `1.8`) is newer than both the manifest version and the old tag.
+4. **Asset matching** (`github.MatchAsset`): first an identical name; then substitution of version variants (`1.2.3`, `123`, `1_2_3`, `1-2-3`) from the old tag/version into the old asset name; then a unique structural match with digit runs masked (`7z#-x#.exe`). Ambiguity is an error, so winget-go falls back to the manifest.
+5. **Integrity**: the expected SHA-256 comes from the asset's GitHub `digest` (`sha256:…`). If GitHub has no digest, installation is refused unless `--ignore-security-hash` is passed.
+6. Installer switches, scope, type and dependencies still come from the manifest. MSI product codes are dropped because they change between versions.
+
+`show --github` prints the latest release tag, date, URL and notes.
+
+## 8. Settings files and exclusion lists
+
+### `winget-go.env`
+
+`config.LoadEnvFiles` runs first in `main`. It reads every existing file named `winget-go.env`, highest precedence first:
+
+1. `config.ConfigDir()/winget-go.env`: `%APPDATA%\winget-go`, `~/Library/Application Support/winget-go` or `~/.config/winget-go` (or `$WINGET_GO_HOME/config`)
+2. machine-wide: `%ProgramData%\winget-go\winget-go.env` or `/etc/winget-go/winget-go.env`
+3. next to the executable (symlinks resolved), which suits a binary deployed to a share or with a management tool
+
+`WINGET_GO_ENV_FILE` replaces the search with one file, which must then exist. The format is dotenv: `KEY=VALUE`, optional `export`, `#` comments, single/double quotes, and double-quoted values that may span lines. Precedence rules:
+
+* **Scalar keys**: a real environment variable wins; otherwise the first file that sets the key wins.
+* **List keys** (`WINGET_GO_EXCLUDE`, `WINGET_GO_EXCLUDE_FILE`): values from the environment and every file are **merged**, so a machine-wide list and a user list combine. These are read through `config.ListSetting`.
+* Only `WINGET_GO_*`, `GITHUB_TOKEN` and `GH_TOKEN` are accepted. Other keys (e.g. `PATH`) are ignored with a warning.
+
+### Exclusions
+
+`exclude.Load` builds a `*exclude.List` from `WINGET_GO_EXCLUDE` (environment + files), the plain-text lists named by `WINGET_GO_EXCLUDE_FILE`, `--exclude` (repeatable, comma-separated) and `--exclude-file`. `--no-exclude` yields an empty list.
+
+* Patterns are `path.Match` globs, lowercased on both sides, matched against the package Id. The `name:` prefix matches the display name instead. Lists split on `,` `;` and newlines, and `#` starts a comment. Invalid patterns are errors, never silently ignored.
+* They apply to `upgrade` (the table, `--all`, and a named package, which errors with a `--no-exclude` hint), to `list` (the Available column shows `(excluded)`, and `--upgrade-available` hides excluded rows) and to `import` (excluded entries are skipped). They do not block an explicit `install`.
+* `winget-go --info` lists the env files searched, whether each was loaded, and the active patterns with their origin.
+
+## 9. Platform support
+
+| Capability | Windows + winget | Windows, no winget | macOS / Linux |
+|---|---|---|---|
+| All winget commands | native passthrough | – | – |
+| search / show / hash / source | ✓ | ✓ | ✓ |
+| download | ✓ | ✓ | ✓ (assumes x64 target unless `-a`) |
+| install / upgrade / uninstall / import | ✓ | ✓ | ✗ (`ErrUnsupported`) |
+| list / export | ✓ | ✓ (ARP + records) | records only (empty) |
+| configure, pin, repair, settings, features, validate | native only | ✗ | ✗ |
+
+## 10. Files on disk
+
+`WINGET_GO_HOME`, if set, relocates everything to `<home>/{cache,config,data}`.
+
+| What | Default location |
+|---|---|
+| Source index, version data, manifests, GitHub cache, cached installers | `os.UserCacheDir()/winget-go` (`%LOCALAPPDATA%\winget-go` on Windows) |
+| `sources.json`, `winget-go.env` (user) | `os.UserConfigDir()/winget-go` (`%APPDATA%\winget-go`) |
+| `winget-go.env` (machine) | `%ProgramData%\winget-go` or `/etc/winget-go`; also next to the executable |
+| `installed.json`, `Packages\`, `Links\`, `logs\` | `%LOCALAPPDATA%\winget-go`; `$XDG_DATA_HOME/winget-go` or `~/.local/share/winget-go` elsewhere |
+
+## 11. Security model
+
+* Index and manifests come over HTTPS from the configured source. **The MSIX signature of `source2.msix` is not verified** (winget relies on the Windows package signature check). Manifests are verified against the SHA-256 in version data, which is in turn keyed by the index hash.
+* Installers are always SHA-256-verified. A mismatch deletes the file and fails unless `--ignore-security-hash` is passed.
+* Archive extraction rejects paths that escape the target directory.
+* Package ids and cache file names are sanitized before use in paths.
+* Native passthrough excludes winget-go's own executable to prevent recursion.
+* Env files can only set winget-go's own settings and GitHub tokens, and no setting turns off hash verification. `--ignore-security-hash` is a flag only.
+
+## 12. Known gaps vs. winget
+
+* No `msstore` or REST (`Microsoft.Rest`) sources; no MSIX signature verification of the source package.
+* No `configure` (DSC), `pin`, `repair` or `settings` in the portable backend.
+* ARP correlation is heuristic for software not installed by winget-go, and ARP version ranges (`arp_min/max_version`) are not used yet.
+* No MSIX enumeration for `list`; no Windows feature/library dependency installation (reported only).
+* Output is winget-style but not byte-identical.
+
+## 13. Build, test, CI and dependency updates
+
+* `go test ./...` runs offline. `internal/source` serves a synthetic v2 source (SQLite index in an MSIX, MSZIP version data, manifest) from `httptest`, and `internal/github` mocks the API.
+* **CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)): gofmt, `go vet` for the host and for `GOOS=windows`, and `go test -race` on Ubuntu, Windows and macOS. It then cross-compiles windows/{amd64,arm64,386}, linux/{amd64,arm64} and darwin/{amd64,arm64} and uploads the binaries as artifacts.
+* **Release** ([`.github/workflows/release.yml`](../.github/workflows/release.yml)): pushing a `v*` tag builds every target with `-X winget-go/internal/config.Version=<tag>`, packages zips/tarballs (binary, README, `winget-go.env.example`) with `SHA256SUMS`, and creates a GitHub release.
+* `internal/exclude` tests that the shipped `winget-go.env.example` parses and that its patterns are valid.
+* **Renovate** ([`renovate.json`](../renovate.json)): weekly grouped PRs for Go modules (with `go mod tidy`), the Go toolchain directive and GitHub Actions (pinned to digests). Vulnerability alerts are raised immediately. The Renovate GitHub App must be installed on the repository.
+
+## Maintaining this document
+
+Update this file in the same change when you:
+
+* add or remove a package or command, or change the backend decision rules (§2, §3);
+* change how sources, version data or manifests are fetched, cached or verified (§4, §11);
+* change installer selection, arguments, execution, elevation or state (§5, §6);
+* change GitHub integration behaviour (§7), env-file or exclusion behaviour (§8; also update `winget-go.env.example`), platform support (§9), file locations (§10), or CI/Renovate (§13);
+* close or open a gap relative to winget (§12).

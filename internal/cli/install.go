@@ -1,0 +1,429 @@
+package cli
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"winget-go/internal/config"
+	"winget-go/internal/engine"
+	"winget-go/internal/exclude"
+	"winget-go/internal/installer"
+	"winget-go/internal/source"
+)
+
+// selectFlags choose among a manifest's installers.
+type selectFlags struct {
+	arch, scope, locale, itype string
+}
+
+func (s *selectFlags) register(cmd *cobra.Command) {
+	f := cmd.Flags()
+	f.StringVarP(&s.arch, "architecture", "a", "", "Select the architecture (x64, x86, arm64, arm, neutral)")
+	f.StringVar(&s.scope, "scope", "", "Select install scope (user or machine)")
+	f.StringVar(&s.locale, "installer-locale", "", "Locale of the installer (BCP47 format)")
+	f.StringVar(&s.itype, "installer-type", "", "Select the installer type (msi, wix, exe, inno, nullsoft, burn, msix, portable, zip)")
+}
+
+func (s *selectFlags) options() installer.SelectOptions {
+	return installer.SelectOptions{Architecture: s.arch, Scope: s.scope, Locale: s.locale, InstallerType: s.itype}
+}
+
+// installFlags are shared by install, upgrade and download.
+type installFlags struct {
+	queryFlags
+	selectFlags
+	version                                string
+	interactive, silent                    bool
+	location, log, override, custom        string
+	force, ignoreHash, skipDeps, acceptPkg bool
+	github                                 bool
+}
+
+func (f *installFlags) register(cmd *cobra.Command, run bool) {
+	f.queryFlags.register(cmd, false)
+	f.selectFlags.register(cmd)
+	fl := cmd.Flags()
+	fl.StringVarP(&f.version, "version", "v", "", "Use the specified version; default is the latest version")
+	fl.BoolVar(&f.ignoreHash, "ignore-security-hash", false, "Ignore the installer hash check failure")
+	fl.BoolVar(&f.skipDeps, "skip-dependencies", false, "Skips processing package dependencies")
+	fl.BoolVar(&f.acceptPkg, "accept-package-agreements", false, "Accept all license agreements for packages")
+	fl.BoolVar(&f.github, "github", config.GitHubEnabledByDefault(),
+		"Use the latest GitHub release when it is newer than the winget manifest (GitHub-hosted installers only)")
+	if !run {
+		return
+	}
+	fl.BoolVarP(&f.interactive, "interactive", "i", false, "Request interactive installation; user input may be needed")
+	fl.BoolVarP(&f.silent, "silent", "h", false, "Request silent installation")
+	fl.StringVarP(&f.location, "location", "l", "", "Location to install to (if supported)")
+	fl.StringVarP(&f.log, "log", "o", "", "Log location (if supported)")
+	fl.StringVar(&f.override, "override", "", "Override arguments to be passed on to the installer")
+	fl.StringVar(&f.custom, "custom", "", "Arguments to be passed on to the installer in addition to the defaults")
+	fl.BoolVar(&f.force, "force", false, "Direct run the command and continue with non security related issues")
+}
+
+func (f *installFlags) request(pkg *source.Package) *engine.Request {
+	mode := installer.ModeSilentWithProgress
+	switch {
+	case f.interactive:
+		mode = installer.ModeInteractive
+	case f.silent:
+		mode = installer.ModeSilent
+	}
+	return &engine.Request{
+		Package: pkg, Version: f.version, Select: f.options(), Mode: mode,
+		Location: f.location, Override: f.override, Custom: f.custom, LogPath: f.log,
+		AcceptAgreements: f.acceptPkg, IgnoreHash: f.ignoreHash,
+		SkipDependencies: f.skipDeps, Force: f.force,
+	}
+}
+
+func installCmd(o Options) *cobra.Command {
+	var f installFlags
+	cmd := &cobra.Command{
+		Use: "install [query]", Aliases: []string{"add"},
+		Short: "Installs the given package",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if f.empty(args) {
+				return errors.New("a package query is required")
+			}
+			e, err := openEngine(cmd.Context(), o, f.source)
+			if err != nil {
+				return err
+			}
+			defer e.Close()
+			e.GitHub = f.github
+			q, _ := f.build(args, source.DefaultInstallFields)
+			pkg, err := e.Resolve(q)
+			if err != nil {
+				return err
+			}
+			return e.Install(cmd.Context(), f.request(pkg))
+		},
+	}
+	f.register(cmd, true)
+	return cmd
+}
+
+func downloadCmd(o Options) *cobra.Command {
+	var f installFlags
+	var dir string
+	cmd := &cobra.Command{
+		Use:   "download [query]",
+		Short: "Downloads the installer from a given package (works on any OS)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if f.empty(args) {
+				return errors.New("a package query is required")
+			}
+			e, err := openEngine(cmd.Context(), o, f.source)
+			if err != nil {
+				return err
+			}
+			defer e.Close()
+			e.GitHub = f.github
+			q, _ := f.build(args, source.DefaultInstallFields)
+			pkg, err := e.Resolve(q)
+			if err != nil {
+				return err
+			}
+			r := f.request(pkg)
+			r.DownloadDir = dir
+			_, err = e.Download(cmd.Context(), r)
+			return err
+		},
+	}
+	f.register(cmd, false)
+	cmd.Flags().StringVarP(&dir, "download-directory", "d", "", "Directory where the installers are downloaded to (default ~/Downloads)")
+	return cmd
+}
+
+func upgradeCmd(o Options) *cobra.Command {
+	var f installFlags
+	var ex excludeFlags
+	var all, includeUnknown bool
+	cmd := &cobra.Command{
+		Use: "upgrade [query]", Aliases: []string{"update"},
+		Short: "Shows and performs available upgrades",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			e, err := openEngine(ctx, o, f.source)
+			if err != nil {
+				return err
+			}
+			defer e.Close()
+			e.GitHub = f.github
+			if e.Exclusions, err = ex.load(); err != nil {
+				return err
+			}
+			ups, err := e.Upgrades(ctx, includeUnknown)
+			if err != nil {
+				return err
+			}
+			var allowed, excluded []engine.Upgrade
+			for _, u := range ups {
+				if u.Excluded() {
+					excluded = append(excluded, u)
+				} else {
+					allowed = append(allowed, u)
+				}
+			}
+			if f.empty(args) && !all {
+				if len(allowed) > 0 {
+					t := table{headers: []string{"Name", "Id", "Version", "Available", "Source"}}
+					for _, u := range allowed {
+						src := u.Item.SourceName()
+						if u.ViaGitHub {
+							src += " (github)"
+						}
+						t.add(u.Item.Name, u.Item.ID(), u.Item.Version, u.Available, src)
+					}
+					t.print(o.Stdout)
+					fmt.Fprintf(o.Stdout, "%d upgrades available.\n", len(allowed))
+				} else {
+					fmt.Fprintln(o.Stdout, "No installed package found with an available upgrade.")
+				}
+				reportExcluded(o, excluded)
+				return nil
+			}
+			var targets []engine.Upgrade
+			if all {
+				targets = allowed
+				reportExcluded(o, excluded)
+				if len(targets) == 0 {
+					fmt.Fprintln(o.Stdout, "No installed package found with an available upgrade.")
+					return nil
+				}
+			} else {
+				term := strings.ToLower(firstNonEmpty(strings.Join(args, " "), f.id, f.name, f.moniker))
+				for _, u := range ups {
+					id, name := strings.ToLower(u.Item.ID()), strings.ToLower(u.Item.Name)
+					if id == term || name == term || (!f.exact && (strings.Contains(id, term) || strings.Contains(name, term))) {
+						targets = append(targets, u)
+					}
+				}
+				if len(targets) == 0 {
+					fmt.Fprintln(o.Stdout, "No available upgrade found.")
+					return engine.ErrNoMatch
+				}
+				if len(targets) > 1 {
+					return fmt.Errorf("multiple installed packages match %q; use --id with --exact", term)
+				}
+				if u := targets[0]; u.Excluded() {
+					return fmt.Errorf("%s is excluded by pattern %q; pass --no-exclude to upgrade it anyway", u.Item.ID(), u.ExcludedBy)
+				}
+			}
+			var failed []string
+			for _, u := range targets {
+				r := f.request(u.Item.Package)
+				r.Upgrade = true
+				r.Force = true // Upgrades() already established a newer version exists
+				if err := e.Install(ctx, r); err != nil {
+					fmt.Fprintf(o.Stderr, "%s: %v\n", u.Item.ID(), err)
+					failed = append(failed, u.Item.ID())
+				}
+			}
+			if len(failed) > 0 {
+				return fmt.Errorf("%d package(s) failed to upgrade: %s", len(failed), strings.Join(failed, ", "))
+			}
+			return nil
+		},
+	}
+	f.register(cmd, true)
+	cmd.Flags().BoolVarP(&all, "all", "r", false, "Upgrade all installed packages to latest if available")
+	cmd.Flags().Bool("recurse", false, "Alias of --all")
+	cmd.Flags().BoolVarP(&includeUnknown, "include-unknown", "u", false, "Upgrade packages even if their current version cannot be determined")
+	ex.register(cmd)
+	cmd.PreRun = func(cmd *cobra.Command, args []string) {
+		if v, _ := cmd.Flags().GetBool("recurse"); v {
+			all = true
+		}
+	}
+	return cmd
+}
+
+func uninstallCmd(o Options) *cobra.Command {
+	var q queryFlags
+	var interactive, silent, all bool
+	cmd := &cobra.Command{
+		Use: "uninstall [query]", Aliases: []string{"remove", "rm"},
+		Short: "Uninstalls the given package",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if q.empty(args) {
+				return errors.New("a package query is required")
+			}
+			e, err := openEngine(cmd.Context(), o, q.source)
+			if err != nil {
+				return err
+			}
+			defer e.Close()
+			term := firstNonEmpty(strings.Join(args, " "), q.id, q.name, q.moniker)
+			items, err := e.FindInstalled(term, q.exact)
+			if err != nil {
+				return err
+			}
+			if len(items) == 0 {
+				fmt.Fprintln(o.Stdout, "No installed package found matching input criteria.")
+				return engine.ErrNoMatch
+			}
+			if len(items) > 1 && !all {
+				t := table{headers: []string{"Name", "Id", "Version"}}
+				for _, it := range items {
+					t.add(it.Name, it.ID(), it.Version)
+				}
+				t.print(o.Stdout)
+				return errors.New("multiple installed packages match; refine the query, or pass --all-versions")
+			}
+			mode := installer.ModeSilentWithProgress
+			if interactive {
+				mode = installer.ModeInteractive
+			} else if silent {
+				mode = installer.ModeSilent
+			}
+			for _, it := range items {
+				fmt.Fprintf(o.Stdout, "Found %s [%s]\n", it.Name, it.ID())
+				if err := e.Uninstall(cmd.Context(), it, engine.UninstallOptions{Mode: mode}); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+	q.register(cmd, false)
+	cmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "Request interactive uninstall")
+	cmd.Flags().BoolVarP(&silent, "silent", "h", false, "Request silent uninstall")
+	cmd.Flags().BoolVar(&all, "all-versions", false, "Uninstall all matching entries")
+	cmd.Flags().Bool("force", false, "Accepted for compatibility")
+	return cmd
+}
+
+func exportCmd(o Options) *cobra.Command {
+	var out, src string
+	var includeVersions bool
+	cmd := &cobra.Command{
+		Use: "export", Short: "Exports a list of the installed packages",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if out == "" {
+				return errors.New("--output is required")
+			}
+			e, err := openEngine(cmd.Context(), o, src)
+			if err != nil {
+				return err
+			}
+			defer e.Close()
+			f, err := e.Export(includeVersions)
+			if err != nil {
+				return err
+			}
+			b, _ := json.MarshalIndent(f, "", "  ")
+			return os.WriteFile(out, b, 0o644)
+		},
+	}
+	cmd.Flags().StringVarP(&out, "output", "o", "", "File where the result is to be written")
+	cmd.Flags().StringVarP(&src, "source", "s", "", "Export packages from the specified source")
+	cmd.Flags().BoolVar(&includeVersions, "include-versions", false, "Include package versions in export file")
+	return cmd
+}
+
+func importCmd(o Options) *cobra.Command {
+	var f installFlags
+	var ex excludeFlags
+	var file string
+	var ignoreUnavailable, ignoreVersions, noUpgrade bool
+	cmd := &cobra.Command{
+		Use: "import", Short: "Installs all the packages in a file",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if file == "" {
+				return errors.New("--import-file is required")
+			}
+			doc, err := engine.LoadExport(file)
+			if err != nil {
+				return err
+			}
+			e, err := openEngine(cmd.Context(), o, "")
+			if err != nil {
+				return err
+			}
+			defer e.Close()
+			e.GitHub = f.github
+			if e.Exclusions, err = ex.load(); err != nil {
+				return err
+			}
+			var failed []string
+			for _, s := range doc.Sources {
+				src := e.SourceByName(s.SourceDetails.Name)
+				if src == nil {
+					return fmt.Errorf("source %q from the import file is not configured", s.SourceDetails.Name)
+				}
+				for _, p := range s.Packages {
+					if pat, ok := e.IsExcluded(p.PackageIdentifier, ""); ok {
+						fmt.Fprintf(o.Stdout, "Skipping %s (excluded by %q)\n", p.PackageIdentifier, pat)
+						continue
+					}
+					pkg, err := src.Lookup(p.PackageIdentifier)
+					if err != nil || pkg == nil {
+						if ignoreUnavailable {
+							fmt.Fprintf(o.Stderr, "Package not found: %s\n", p.PackageIdentifier)
+							continue
+						}
+						return fmt.Errorf("package not found: %s", p.PackageIdentifier)
+					}
+					r := f.request(pkg)
+					if !ignoreVersions {
+						r.Version = p.Version
+					}
+					if !noUpgrade {
+						r.Upgrade = true
+					}
+					if err := e.Install(cmd.Context(), r); err != nil {
+						fmt.Fprintf(o.Stderr, "%s: %v\n", p.PackageIdentifier, err)
+						failed = append(failed, p.PackageIdentifier)
+					}
+				}
+			}
+			if len(failed) > 0 {
+				return fmt.Errorf("%d package(s) failed: %s", len(failed), strings.Join(failed, ", "))
+			}
+			return nil
+		},
+	}
+	f.register(cmd, false)
+	cmd.Flags().StringVarP(&file, "import-file", "i", "", "File describing the packages to install")
+	cmd.Flags().BoolVar(&ignoreUnavailable, "ignore-unavailable", false, "Ignore unavailable packages")
+	cmd.Flags().BoolVar(&ignoreVersions, "ignore-versions", false, "Ignore package versions in import file")
+	cmd.Flags().BoolVar(&noUpgrade, "no-upgrade", false, "Skips upgrade if an installed version already exists")
+	ex.register(cmd)
+	return cmd
+}
+
+// excludeFlags are the per-run exclusion list controls.
+type excludeFlags struct {
+	patterns []string
+	files    []string
+	disable  bool
+}
+
+func (x *excludeFlags) register(cmd *cobra.Command) {
+	f := cmd.Flags()
+	f.StringArrayVar(&x.patterns, "exclude", nil,
+		"Exclude packages matching a pattern (glob on Id, or name:<glob>); repeatable or comma-separated")
+	f.StringArrayVar(&x.files, "exclude-file", nil, "Read exclusion patterns from a file; repeatable")
+	f.BoolVar(&x.disable, "no-exclude", false, "Ignore all exclusion lists (env, env files and flags) for this run")
+}
+
+func (x *excludeFlags) load() (*exclude.List, error) {
+	return exclude.Load(exclude.Options{Patterns: x.patterns, Files: x.files, Disable: x.disable})
+}
+
+func reportExcluded(o Options, excluded []engine.Upgrade) {
+	if len(excluded) == 0 {
+		return
+	}
+	fmt.Fprintf(o.Stdout, "%d package(s) have upgrades but are excluded (use --no-exclude to include them):\n", len(excluded))
+	for _, u := range excluded {
+		fmt.Fprintf(o.Stdout, "  %s %s -> %s  [%s]\n", u.Item.ID(), u.Item.Version, u.Available, u.ExcludedBy)
+	}
+}
