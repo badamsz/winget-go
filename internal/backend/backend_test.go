@@ -68,6 +68,8 @@ func TestDecide(t *testing.T) {
 		{"uninstall", "Microsoft.DotNet.*"},
 		{"rm", "--id", "Python.Python.3.1?"},
 		{"uninstall", "--name=Python 3.*"},
+		{"upgrade", "Microsoft.VCRedist.*"},
+		{"update", "--id", "Microsoft.DotNet.?"},
 	} {
 		if d, _ := Decide(args, found, Hints{}); d.Kind != Portable {
 			t.Fatalf("wildcard uninstall %v should be portable: %+v", args, d)
@@ -77,7 +79,7 @@ func TestDecide(t *testing.T) {
 		t.Fatalf("plain uninstall should stay native: %+v", d)
 	}
 	if d, _ := Decide([]string{"search", "foo*"}, found, Hints{}); d.Kind != Native {
-		t.Fatalf("wildcards only matter for uninstall: %+v", d)
+		t.Fatalf("wildcards only matter for uninstall/upgrade: %+v", d)
 	}
 	if d, _ := Decide([]string{"--backend=native", "uninstall", "foo*"}, found, Hints{}); d.Kind != Native || d.Warning == "" {
 		t.Fatalf("explicit native wildcard uninstall should warn: %+v", d)

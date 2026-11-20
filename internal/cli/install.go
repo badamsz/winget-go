@@ -159,7 +159,12 @@ EXE-style or portable). If a new version is only published for a different
 technology (e.g. PowerShell moving from MSI to MSIX), the upgrade stops and
 explains why. Pass --migrate to switch technology: the new installer is
 downloaded and verified first, then the old copy is uninstalled and the new
-version installed.`,
+version installed.
+
+The query may be a wildcard pattern (*, ?, [...]) matched case-insensitively
+against the whole Id or display name, e.g. "Microsoft.VCRedist.*". Every
+matching package with an upgrade is upgraded; excluded packages are skipped.
+Quote the pattern so your shell doesn't expand it.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			e, err := openEngine(ctx, o, f.source)
@@ -175,14 +180,7 @@ version installed.`,
 			if err != nil {
 				return err
 			}
-			var allowed, excluded []engine.Upgrade
-			for _, u := range ups {
-				if u.Excluded() {
-					excluded = append(excluded, u)
-				} else {
-					allowed = append(allowed, u)
-				}
-			}
+			allowed, excluded := splitExcluded(ups)
 			if f.empty(args) && !all {
 				if len(allowed) > 0 {
 					t := table{headers: []string{"Name", "Id", "Version", "Available", "Source"}}
@@ -203,29 +201,58 @@ version installed.`,
 			}
 			var targets []engine.Upgrade
 			if all {
-				targets = allowed
+				targets = dedupeUpgrades(allowed)
 				reportExcluded(o, excluded)
 				if len(targets) == 0 {
 					fmt.Fprintln(o.Stdout, "No installed package found with an available upgrade.")
 					return nil
 				}
 			} else {
-				term := strings.ToLower(firstNonEmpty(strings.Join(args, " "), f.id, f.name, f.moniker))
+				term := firstNonEmpty(strings.Join(args, " "), f.id, f.name, f.moniker)
+				byItem := map[*installed.Item]engine.Upgrade{}
+				items := make([]*installed.Item, 0, len(ups))
 				for _, u := range ups {
-					id, name := strings.ToLower(u.Item.ID()), strings.ToLower(u.Item.Name)
-					if id == term || name == term || (!f.exact && (strings.Contains(id, term) || strings.Contains(name, term))) {
-						targets = append(targets, u)
+					byItem[u.Item] = u
+					items = append(items, u.Item)
+				}
+				matched, err := engine.MatchInstalled(items, term, f.exact)
+				if err != nil {
+					return err
+				}
+				for _, it := range matched {
+					targets = append(targets, byItem[it])
+				}
+				if engine.HasWildcard(term) {
+					// A pattern behaves like a filtered --all: excluded
+					// packages are skipped (and reported), not errors.
+					var skipped []engine.Upgrade
+					targets, skipped = splitExcluded(targets)
+					reportExcluded(o, skipped)
+					if len(targets) == 0 {
+						// Like --all with nothing to do: not an error.
+						fmt.Fprintf(o.Stdout, "No available upgrade matches %q.\n", term)
+						return nil
 					}
-				}
-				if len(targets) == 0 {
-					fmt.Fprintln(o.Stdout, "No available upgrade found.")
-					return engine.ErrNoMatch
-				}
-				if len(targets) > 1 {
-					return fmt.Errorf("multiple installed packages match %q; use --id with --exact", term)
-				}
-				if u := targets[0]; u.Excluded() {
-					return fmt.Errorf("%s is excluded by pattern %q; pass --no-exclude to upgrade it anyway", u.Item.ID(), u.ExcludedBy)
+					targets = dedupeUpgrades(targets)
+					if len(targets) > 1 {
+						t := table{headers: []string{"Name", "Id", "Version", "Available", "Source"}}
+						for _, u := range targets {
+							t.add(u.Item.Name, u.Item.ID(), u.Item.Version, u.Available, u.Item.SourceName())
+						}
+						t.print(o.Stdout)
+						fmt.Fprintf(o.Stdout, "Upgrading %d packages matching %q.\n", len(targets), term)
+					}
+				} else {
+					if len(targets) == 0 {
+						fmt.Fprintln(o.Stdout, "No available upgrade found.")
+						return engine.ErrNoMatch
+					}
+					if targets = dedupeUpgrades(targets); len(targets) > 1 {
+						return fmt.Errorf("multiple installed packages match %q; use --id with --exact, or a wildcard pattern to upgrade them all", term)
+					}
+					if u := targets[0]; u.Excluded() {
+						return fmt.Errorf("%s is excluded by pattern %q; pass --no-exclude to upgrade it anyway", u.Item.ID(), u.ExcludedBy)
+					}
 				}
 			}
 			var failed []string
@@ -638,6 +665,34 @@ func (x *excludeFlags) register(cmd *cobra.Command) {
 
 func (x *excludeFlags) load() (*exclude.List, error) {
 	return exclude.Load(exclude.Options{Patterns: x.patterns, Files: x.files, Disable: x.disable})
+}
+
+// splitExcluded separates upgrades blocked by the exclusion list.
+func splitExcluded(ups []engine.Upgrade) (allowed, excluded []engine.Upgrade) {
+	for _, u := range ups {
+		if u.Excluded() {
+			excluded = append(excluded, u)
+		} else {
+			allowed = append(allowed, u)
+		}
+	}
+	return allowed, excluded
+}
+
+// dedupeUpgrades keeps one upgrade per package Id: several installed
+// entries (e.g. two ARP keys) can map to the same package, which only
+// needs to be installed once.
+func dedupeUpgrades(ups []engine.Upgrade) []engine.Upgrade {
+	seen := map[string]bool{}
+	var out []engine.Upgrade
+	for _, u := range ups {
+		id := strings.ToLower(u.Item.Package.ID)
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 func reportExcluded(o Options, excluded []engine.Upgrade) {

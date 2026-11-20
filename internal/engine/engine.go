@@ -178,27 +178,45 @@ func (e *Engine) Installed() ([]*installed.Item, error) {
 func HasWildcard(term string) bool { return strings.ContainsAny(term, "*?[") }
 
 // FindInstalled returns installed items matching a query (by package id,
-// name, or ARP key).
-//
-// A term containing *, ? or [ is a case-insensitive glob (path.Match
-// syntax) that must match the whole Id or the whole display name, e.g.
-// "Microsoft.DotNet.*" or "Python 3.1?.*". Backslashes are literal so
-// ARP and MSIX ids (ARP\Machine\X64\..., MSIX\...) can be matched as written. Otherwise an exact Id match
-// wins; failing that, names (with exact) or Id/name substrings match.
+// name, or ARP key); see MatchInstalled for the rules.
 func (e *Engine) FindInstalled(term string, exact bool) ([]*installed.Item, error) {
-	t := strings.ToLower(term)
-	glob := HasWildcard(t)
-	if glob {
-		t = globPattern(t)
-		if _, err := path.Match(t, ""); err != nil {
-			return nil, fmt.Errorf("invalid wildcard pattern %q: %w", term, err)
-		}
+	if _, err := compileTerm(term); err != nil {
+		return nil, err
 	}
 	items, err := e.Installed()
 	if err != nil {
 		return nil, err
 	}
-	return matchInstalled(items, t, exact, glob), nil
+	return MatchInstalled(items, term, exact)
+}
+
+// MatchInstalled filters items by a query, as used by uninstall and
+// upgrade.
+//
+// A term containing *, ? or [ is a case-insensitive glob (path.Match
+// syntax) that must match the whole Id or the whole display name, e.g.
+// "Microsoft.DotNet.*" or "Python 3.1?.*". Backslashes are literal so
+// ARP and MSIX ids (ARP\Machine\X64\..., MSIX\...) can be matched as
+// written. Otherwise an exact Id match wins; failing that, names (with
+// exact) or Id/name substrings match.
+func MatchInstalled(items []*installed.Item, term string, exact bool) ([]*installed.Item, error) {
+	t, err := compileTerm(term)
+	if err != nil {
+		return nil, err
+	}
+	return matchInstalled(items, t, exact, HasWildcard(term)), nil
+}
+
+// compileTerm lowercases a term and, for patterns, validates the glob.
+func compileTerm(term string) (string, error) {
+	if !HasWildcard(term) {
+		return strings.ToLower(term), nil
+	}
+	t := globPattern(term)
+	if _, err := path.Match(t, ""); err != nil {
+		return "", fmt.Errorf("invalid wildcard pattern %q: %w", term, err)
+	}
+	return t, nil
 }
 
 // globPattern lowercases a user pattern and makes backslashes literal.

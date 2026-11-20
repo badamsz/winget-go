@@ -58,6 +58,15 @@ winget-go upgrade --github                    # include GitHub releases in upgra
 
 The installer hash comes from GitHub's published asset digest. If GitHub has no digest for an asset, winget-go refuses to install it unless you pass `--ignore-security-hash`. Set `GITHUB_TOKEN` to raise the API rate limit.
 
+### Upgrading with wildcards
+
+`upgrade` accepts the same wildcard patterns as `uninstall`. Every matching package that has an upgrade is upgraded, and excluded packages are skipped:
+
+```sh
+winget-go upgrade "Microsoft.VCRedist.*"
+winget-go upgrade "Microsoft.DotNet.*" --migrate
+```
+
 ### Changing install technology
 
 An upgrade keeps the technology of the installed copy (MSI, MSIX, EXE-style or portable), as native winget does. Sometimes a publisher switches technology. For example, PowerShell 7.7 ships only as an MSIX, while 7.6 was an MSI. Installing the MSIX would just put a second copy beside the old one, so the upgrade stops and explains why. To switch anyway:
@@ -85,7 +94,7 @@ MSIX packages (frameworks such as `Microsoft.WindowsAppRuntime.*`, `Microsoft.UI
 winget-go uninstall "Microsoft.WindowsAppRuntime.*" --old-versions=all --dry-run
 ```
 
-Quote the pattern so your shell doesn't expand it. If several packages match, winget-go lists them and asks you to confirm. In scripts, pass `--disable-interactivity`; without a terminal winget-go refuses rather than guess. Patterns skip anything on the exclusion list. Native winget doesn't support wildcards, so a wildcard `uninstall` always uses the Go implementation.
+Quote the pattern so your shell doesn't expand it. If several packages match, winget-go lists them and asks you to confirm. In scripts, pass `--disable-interactivity`; without a terminal winget-go refuses rather than guess. Patterns skip anything on the exclusion list. Native winget doesn't support wildcards, so a wildcard `uninstall` or `upgrade` always uses the Go implementation.
 
 ### Removing old versions
 

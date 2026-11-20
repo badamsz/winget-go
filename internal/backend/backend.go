@@ -44,12 +44,12 @@ func usesExclusions(args []string) bool {
 	return false
 }
 
-// usesWildcardUninstall reports whether an uninstall query (positional or
-// flag value) is a glob pattern. Native winget would treat "*" literally,
-// so winget-go handles these itself.
-func usesWildcardUninstall(args []string) bool {
+// usesWildcardQuery reports whether an uninstall or upgrade query
+// (positional or flag value) is a glob pattern. Native winget would treat
+// "*" literally, so winget-go handles these itself.
+func usesWildcardQuery(args []string) bool {
 	switch Command(args) {
-	case "uninstall", "remove", "rm":
+	case "uninstall", "remove", "rm", "upgrade", "update":
 	default:
 		return false
 	}
@@ -151,8 +151,8 @@ func Decide(args []string, find func() string, h Hints) (*Decision, error) {
 		if h.ExclusionsConfigured && usesExclusions(rest) {
 			d.Warning = "exclusion list is ignored by the native winget backend"
 		}
-		if usesWildcardUninstall(rest) {
-			d.Warning = "native winget does not support wildcard uninstall queries; the pattern is matched literally"
+		if usesWildcardQuery(rest) {
+			d.Warning = "native winget does not support wildcard queries; the pattern is matched literally"
 		}
 		return d, nil
 	case Auto:
@@ -171,8 +171,8 @@ func Decide(args []string, find func() string, h Hints) (*Decision, error) {
 		d.Kind, d.Reason = Portable, "exclusion list applies to `"+Command(rest)+"`"
 		return d, nil
 	}
-	if usesWildcardUninstall(rest) {
-		d.Kind, d.Reason = Portable, "wildcard uninstall is a winget-go feature"
+	if usesWildcardQuery(rest) {
+		d.Kind, d.Reason = Portable, "wildcard `"+Command(rest)+"` is a winget-go feature"
 		return d, nil
 	}
 	if p := find(); p != "" {
