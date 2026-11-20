@@ -7,7 +7,11 @@ package platform
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"html"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -147,4 +151,87 @@ func MSResourceURI(pkgName, ref string) string {
 		return pfx + "//" + pkgName + "/" + r
 	}
 	return pfx + "//" + pkgName + "/Resources/" + r
+}
+
+// MSIX deployment HRESULTs that get special handling.
+const (
+	HResultPackageNotFound   = 0x80073CF1 // ERROR_INSTALL_PACKAGE_NOT_FOUND
+	HResultDependencyFailure = 0x80073CF3 // ERROR_INSTALL_RESOLVE_DEPENDENCY_FAILED
+	HResultAccessDenied      = 0x80070005 // E_ACCESSDENIED
+)
+
+// MSIXError is a failed MSIX deployment operation with a readable message.
+type MSIXError struct {
+	HResult uint32
+	Message string   // cleaned PowerShell/deployment message
+	UsedBy  []string // for a framework in use: the packages depending on it
+}
+
+func (e *MSIXError) Error() string {
+	switch {
+	case len(e.UsedBy) > 0:
+		return fmt.Sprintf("this framework is in use by %s; Windows removes a framework automatically once nothing depends on it",
+			strings.Join(e.UsedBy, ", "))
+	case e.HResult == HResultAccessDenied:
+		return "access denied; run from an elevated prompt (0x80070005)"
+	case e.HResult != 0 && !strings.Contains(e.Message, fmt.Sprintf("%08X", e.HResult)):
+		return fmt.Sprintf("%s (0x%08X)", e.Message, e.HResult)
+	}
+	return e.Message
+}
+
+var (
+	clixmlError = regexp.MustCompile(`(?s)<S S="Error">(.*?)</S>`)
+	clixmlEsc   = regexp.MustCompile(`_x([0-9A-Fa-f]{4})_`)
+	psHResult   = regexp.MustCompile(`HRESULT:\s*0x([0-9A-Fa-f]{8})`)
+	psUsedBy    = regexp.MustCompile(`(?s)because package\(s\)\s+(.+?)\s+currently depends? on the framework`)
+	spaces      = regexp.MustCompile(`\s+`)
+)
+
+// DecodeCLIXML extracts the error text from PowerShell's serialized
+// stderr ("#< CLIXML" followed by <Objs>), dropping progress records.
+// Other input is returned unchanged.
+func DecodeCLIXML(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "#< CLIXML") {
+		return s
+	}
+	var b strings.Builder
+	for _, m := range clixmlError.FindAllStringSubmatch(s, -1) {
+		b.WriteString(html.UnescapeString(m[1]))
+	}
+	return clixmlEsc.ReplaceAllStringFunc(b.String(), func(x string) string {
+		n, _ := strconv.ParseUint(x[2:6], 16, 16)
+		return string(rune(n))
+	})
+}
+
+// ParseMSIXError turns the output of a failed Remove-AppxPackage (plain
+// text or CLIXML) into an MSIXError: the HRESULT, the deployment message
+// without PowerShell's script position/category noise, and for a
+// framework in use the list of dependent packages.
+func ParseMSIXError(out string, hresult uint32) *MSIXError {
+	msg := DecodeCLIXML(out)
+	if i := strings.Index(msg, "NOTE: For additional information"); i >= 0 {
+		msg = msg[:i]
+	}
+	if i := strings.Index(msg, "\nAt line:"); i >= 0 {
+		msg = msg[:i]
+	}
+	msg = strings.TrimSpace(spaces.ReplaceAllString(msg, " "))
+	msg = strings.TrimPrefix(msg, "Remove-AppxPackage : ")
+	e := &MSIXError{HResult: hresult, Message: msg}
+	if e.HResult == 0 {
+		if m := psHResult.FindStringSubmatch(msg); m != nil {
+			n, _ := strconv.ParseUint(m[1], 16, 32)
+			e.HResult = uint32(n)
+		}
+	}
+	if m := psUsedBy.FindStringSubmatch(msg); m != nil {
+		e.UsedBy = strings.Fields(m[1])
+	}
+	if e.Message == "" {
+		e.Message = "Remove-AppxPackage failed"
+	}
+	return e
 }

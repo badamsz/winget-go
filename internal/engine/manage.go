@@ -43,9 +43,9 @@ func (e *Engine) Uninstall(ctx context.Context, it *installed.Item, o UninstallO
 	}
 	if m := it.MSIX; m != nil {
 		if m.NonRemovable {
-			return fmt.Errorf("%s is a system package and can't be removed", it.Name)
+			return fmt.Errorf("%s is a system package that Windows does not allow to be removed", it.Label())
 		}
-		fmt.Fprintf(e.Out, "Starting package uninstall of %s...\n", it.Name)
+		fmt.Fprintf(e.Out, "Starting package uninstall of %s...\n", it.Label())
 		if err := platform.RemoveMSIX(ctx, m.FullName); err != nil {
 			return err
 		}
@@ -66,7 +66,7 @@ func (e *Engine) Uninstall(ctx context.Context, it *installed.Item, o UninstallO
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(e.Out, "Starting package uninstall of %s...\n", it.Name)
+	fmt.Fprintf(e.Out, "Starting package uninstall of %s...\n", it.Label())
 	elevate := a.Scope == "machine" && !platform.IsElevated()
 	code, err := platform.Run(ctx, exe, args, elevate)
 	if err != nil {

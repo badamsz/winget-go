@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -14,6 +16,7 @@ import (
 	"winget-go/internal/exclude"
 	"winget-go/internal/installed"
 	"winget-go/internal/installer"
+	"winget-go/internal/platform"
 	"winget-go/internal/source"
 )
 
@@ -317,9 +320,9 @@ is considered (honouring the exclusion list). Use --dry-run to preview.`,
 				return engine.ErrNoMatch
 			}
 			if len(items) > 1 {
-				t := table{headers: []string{"Name", "Id", "Version"}}
+				t := table{headers: []string{"Name", "Id", "Version", "Arch"}}
 				for _, it := range items {
-					t.add(it.Name, it.ID(), it.Version)
+					t.add(it.Name, it.ID(), it.Version, it.Arch())
 				}
 				t.print(o.Stdout)
 				if !wildcard && !all {
@@ -391,14 +394,14 @@ func uninstallOldVersions(cmd *cobra.Command, o Options, q *queryFlags, ex *excl
 		fmt.Fprintln(o.Stdout, "No old versions found to remove.")
 		return nil
 	}
-	t := table{headers: []string{"Name", "Id", "Version", "Line", "Action"}}
+	t := table{headers: []string{"Name", "Id", "Version", "Arch", "Line", "Action"}}
 	var targets []*installed.Item
 	for _, g := range groups {
 		for _, it := range g.Keep {
-			t.add(it.Name, it.ID(), it.Version, g.Line, "keep")
+			t.add(it.Name, it.ID(), it.Version, it.Arch(), g.Line, "keep")
 		}
 		for _, it := range g.Remove {
-			t.add(it.Name, it.ID(), it.Version, g.Line, "REMOVE")
+			t.add(it.Name, it.ID(), it.Version, it.Arch(), g.Line, "REMOVE")
 			targets = append(targets, it)
 		}
 	}
@@ -454,23 +457,52 @@ func confirmBulk(cmd *cobra.Command, o Options, prompt string) error {
 }
 
 // uninstallEach uninstalls every item, continuing past failures and
-// reporting them together.
+// reporting them together. MSIX frameworks go last: Windows refuses to
+// remove a framework while packages depend on it, and removes it by
+// itself once the last dependent is gone.
 func uninstallEach(cmd *cobra.Command, o Options, e *engine.Engine, items []*installed.Item, mode installer.Mode, what string) error {
+	items = slices.Clone(items)
+	slices.SortStableFunc(items, func(a, b *installed.Item) int {
+		return cmp.Compare(isFramework(a), isFramework(b))
+	})
 	var failed []string
-	for _, it := range items {
-		fmt.Fprintf(o.Stdout, "Uninstalling %s %s [%s]...\n", it.Name, it.Version, it.ID())
-		if err := e.Uninstall(cmd.Context(), it, engine.UninstallOptions{Mode: mode}); err != nil {
-			if len(items) == 1 {
-				return err
-			}
-			fmt.Fprintf(o.Stderr, "  %v\n", err)
-			failed = append(failed, strings.TrimSpace(it.Name+" "+it.Version))
+	inUse := 0
+	for i, it := range items {
+		if i > 0 {
+			fmt.Fprintln(o.Stdout)
+		}
+		err := e.Uninstall(cmd.Context(), it, engine.UninstallOptions{Mode: mode})
+		if err == nil {
+			continue
+		}
+		if len(items) == 1 {
+			return err
+		}
+		fmt.Fprintf(o.Stderr, "Failed: %v\n", err)
+		failed = append(failed, it.Label())
+		var me *platform.MSIXError
+		if errors.As(err, &me) && len(me.UsedBy) > 0 {
+			inUse++
 		}
 	}
-	if len(failed) > 0 {
-		return fmt.Errorf("%d of %d %s failed to uninstall: %s", len(failed), len(items), what, strings.Join(failed, "; "))
+	if len(failed) == 0 {
+		return nil
 	}
-	return nil
+	fmt.Fprintf(o.Stderr, "\n%d of %d %s failed to uninstall:\n", len(failed), len(items), what)
+	for _, f := range failed {
+		fmt.Fprintf(o.Stderr, "  %s\n", f)
+	}
+	if inUse > 0 {
+		fmt.Fprintf(o.Stderr, "%d of them are frameworks still used by other packages. Uninstall those packages (or leave the frameworks in place).\n", inUse)
+	}
+	return fmt.Errorf("%d of %d %s failed to uninstall", len(failed), len(items), what)
+}
+
+func isFramework(it *installed.Item) int {
+	if it.MSIX != nil && it.MSIX.IsFramework {
+		return 1
+	}
+	return 0
 }
 
 func isTerminal(f *os.File) bool {

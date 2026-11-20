@@ -36,6 +36,26 @@ func (it *Item) ID() string {
 	return ""
 }
 
+// Arch returns the architecture when it is known exactly (MSIX), or "".
+func (it *Item) Arch() string {
+	if it.MSIX != nil && it.MSIX.Architecture != "neutral" {
+		return it.MSIX.Architecture
+	}
+	return ""
+}
+
+// Label is a human-readable "Name Version (arch)" for messages.
+func (it *Item) Label() string {
+	s := it.Name
+	if it.Version != "" && !strings.Contains(s, it.Version) {
+		s += " " + it.Version
+	}
+	if a := it.Arch(); a != "" {
+		s += " (" + a + ")"
+	}
+	return s
+}
+
 // SourceName returns the matched source name, or "".
 func (it *Item) SourceName() string {
 	if it.Package != nil {

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"unicode/utf16"
@@ -269,7 +270,7 @@ func powershell(ctx context.Context, script string) ([]byte, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
+		msg := DecodeCLIXML(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
@@ -279,6 +280,7 @@ func powershell(ctx context.Context, script string) ([]byte, error) {
 }
 
 const appxListScript = `$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
 $p = @(Get-AppxPackage | Where-Object { -not $_.IsResourcePackage -and -not $_.IsBundle } | ForEach-Object {
   [pscustomobject]@{
@@ -359,11 +361,35 @@ func resolveManifestString(p *MSIXPackage, v string) string {
 	return windows.UTF16ToString(buf)
 }
 
-// RemoveMSIX uninstalls an MSIX package for the current user.
+// RemoveMSIX uninstalls an MSIX package for the current user. Failures
+// are returned as *MSIXError. A package that is already gone (e.g. a
+// framework Windows removed together with its last dependent) counts as
+// success.
 func RemoveMSIX(ctx context.Context, fullName string) error {
-	script := "$ErrorActionPreference = 'Stop'\nRemove-AppxPackage -Package '" + strings.ReplaceAll(fullName, "'", "''") + "'"
-	if _, err := powershell(ctx, script); err != nil {
-		return fmt.Errorf("Remove-AppxPackage %s: %w", fullName, err)
+	// Catch the exception in the script and print "0x<HRESULT>" plus the
+	// message, so we never have to read PowerShell's CLIXML error stream.
+	script := `$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+try { Remove-AppxPackage -Package '` + strings.ReplaceAll(fullName, "'", "''") + `' }
+catch { [Console]::Out.WriteLine(('0x{0:X8}' -f $_.Exception.HResult)); [Console]::Out.Write($_.Exception.Message); exit 1 }`
+	out, err := powershell(ctx, script)
+	if err == nil {
+		return nil
 	}
-	return nil
+	text := strings.TrimSpace(string(out))
+	var hr uint32
+	if first, rest, ok := strings.Cut(text, "\n"); ok || strings.HasPrefix(text, "0x") {
+		if n, perr := strconv.ParseUint(strings.TrimPrefix(strings.TrimSpace(first), "0x"), 16, 32); perr == nil {
+			hr, text = uint32(n), rest
+		}
+	}
+	if strings.TrimSpace(text) == "" {
+		text = err.Error() // PowerShell itself failed (e.g. not available)
+	}
+	me := ParseMSIXError(text, hr)
+	if me.HResult == HResultPackageNotFound {
+		return nil
+	}
+	return me
 }
