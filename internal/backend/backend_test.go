@@ -58,4 +58,7 @@ func TestDecide(t *testing.T) {
 	if d, _ := Decide([]string{"upgrade", "--no-exclude"}, found, Hints{}); d.Kind != Portable {
 		t.Fatalf("--no-exclude is a winget-go flag: %+v", d)
 	}
+	if d, _ := Decide([]string{"uninstall", "--old-versions=minor"}, found, Hints{}); d.Kind != Portable {
+		t.Fatalf("--old-versions is a winget-go flag: %+v", d)
+	}
 }

@@ -26,7 +26,7 @@ flowchart TD
     B -- native --> N{winget.exe found?}
     N -- yes --> X[exec winget.exe args]
     N -- no --> E[error]
-    B -- auto/unset --> G{winget-go-only flag?<br/>--github, --exclude, --no-exclude ...}
+    B -- auto/unset --> G{winget-go-only flag?<br/>--github, --exclude, --old-versions ...}
     G -- yes --> P
     G -- no --> XC{exclusions configured and<br/>upgrade / import / list --upgrade-available?}
     XC -- yes --> P
@@ -50,7 +50,7 @@ flowchart TD
 | `cmd/winget-go` | Entry point: backend decision, passthrough, signal handling, exit codes. |
 | `internal/backend` | `auto` / `native` / `portable` resolution and native passthrough. |
 | `internal/cli` | Cobra command tree that mirrors winget's commands and flags (`-h` = `--silent`, so help is `--help`). Renders winget-style tables. |
-| `internal/engine` | The portable backend's operations: resolve, plan, download, install, upgrade, uninstall, export/import. Coordinates every package below. |
+| `internal/engine` | The portable backend's operations: resolve, plan, download, install, upgrade, uninstall (including old-version cleanup planning), export/import. Coordinates every package below. |
 | `internal/source` | Pre-indexed source v2: index download/extract, SQLite queries, version data, manifest fetch and verification, ARP name normalization. |
 | `internal/mszyml` | Decoder for `.mszyml` (Windows Compression API buffer with MSZIP blocks). |
 | `internal/manifest` | Merged-manifest model, root-to-installer default merging, localization overlay. |
@@ -61,7 +61,7 @@ flowchart TD
 | `internal/httpx` | Shared HTTP client, User-Agent, streaming download with progress and SHA-256. |
 | `internal/config` | On-disk locations, `sources.json`, environment settings, `winget-go.env` discovery/parsing, version string. |
 | `internal/exclude` | Exclusion lists: pattern parsing (globs on Id, `name:` globs on display name), loading from env/env files/flags/list files, matching. |
-| `internal/version` | winget-compatible version comparison. |
+| `internal/version` | winget-compatible version comparison and version-line prefixes (`Prefix`). |
 
 Dependency direction: `cli → engine → {source, installer, installed, github, exclude} → {manifest, platform, httpx, config, version, mszyml}`. `platform` imports nothing internal, which keeps the OS-specific surface small.
 
@@ -141,7 +141,15 @@ Order: mode → log → scope (`/CURRENTUSER`/`/ALLUSERS` for Inno, `ALLUSERS`/`
 
 **Upgrade** (`engine.Upgrades`): installed items whose matched package has a higher `latest_version` (or a newer GitHub release with `--github`). Each result carries `ExcludedBy` when it matches the exclusion list (§8); excluded packages skip the GitHub lookup. `UpgradeBehavior: uninstallPrevious` uninstalls first; `deny` refuses.
 
-**Uninstall**: portable records → delete links and directory. ARP entries → `msiexec /x {ProductCode}` for Windows Installer products; otherwise `QuietUninstallString`; otherwise `UninstallString` plus technology-specific silent switches (based on the recorded or manifest installer type).
+**Uninstall**: portable records → delete links and directory. ARP entries → `msiexec /x {ProductCode}` for Windows Installer products; otherwise `QuietUninstallString`; otherwise `UninstallString` plus technology-specific silent switches (based on the recorded or manifest installer type). After a successful uninstall, only the removed ARP key is dropped from the package's record; the record itself is deleted once it has no keys left. This keeps side-by-side versions tracked correctly.
+
+**Old-version cleanup** (`uninstall --old-versions[=major|minor|all] [--keep N] [--dry-run]`): `engine.PlanOldVersions` is a pure function over installed items, so it is unit-tested without Windows.
+
+1. **Product key**: the package Id when matched, otherwise `source.NameKey(displayName)` plus normalized publisher. Either way the architecture suffix and the ARP scope (user/machine) are part of the key, so x86/x64 and per-user/per-machine installs are never "old versions" of each other.
+2. **Version line**: `version.Prefix(v, 1)` for `major`, `version.Prefix(v, 2)` for `minor`, and one line for `all`. Items with an empty or `Unknown` version are skipped.
+3. **Selection**: each line is sorted newest first and the first `keep` items are kept. The rest are removed only if strictly older than the oldest kept version, so duplicates of a kept version are never touched.
+
+The CLI applies the exclusion list (§8) before planning, prints a keep/REMOVE table, stops for `--dry-run`, confirms on a TTY unless `--disable-interactivity` is set, then uninstalls each target and reports failures together. `--old-versions` uses `NoOptDefVal`, so a bare `major`/`minor`/`all` positional is rejected with a hint to use `=`.
 
 ## 6. Installed-app correlation
 
@@ -188,7 +196,7 @@ Enabled with `--github` on `install`, `upgrade`, `download`, `show`, `list` and 
 `exclude.Load` builds a `*exclude.List` from `WINGET_GO_EXCLUDE` (environment + files), the plain-text lists named by `WINGET_GO_EXCLUDE_FILE`, `--exclude` (repeatable, comma-separated) and `--exclude-file`. `--no-exclude` yields an empty list.
 
 * Patterns are `path.Match` globs, lowercased on both sides, matched against the package Id. The `name:` prefix matches the display name instead. Lists split on `,` `;` and newlines, and `#` starts a comment. Invalid patterns are errors, never silently ignored.
-* They apply to `upgrade` (the table, `--all`, and a named package, which errors with a `--no-exclude` hint), to `list` (the Available column shows `(excluded)`, and `--upgrade-available` hides excluded rows) and to `import` (excluded entries are skipped). They do not block an explicit `install`.
+* They apply to `upgrade` (the table, `--all`, and a named package, which errors with a `--no-exclude` hint), to `list` (the Available column shows `(excluded)`, and `--upgrade-available` hides excluded rows), to `import` (excluded entries are skipped) and to `uninstall --old-versions` (excluded products are never removed). They do not block an explicit `install` or a plain `uninstall`.
 * `winget-go --info` lists the env files searched, whether each was loaded, and the active patterns with their origin.
 
 ## 9. Platform support

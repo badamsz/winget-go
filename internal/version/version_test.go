@@ -38,3 +38,23 @@ func TestSortDesc(t *testing.T) {
 		}
 	}
 }
+
+func TestPrefix(t *testing.T) {
+	cases := []struct {
+		v    string
+		n    int
+		want string
+	}{
+		{"3.11.4", 1, "3"},
+		{"3.11.4", 2, "3.11"},
+		{"7", 2, "7.0"},
+		{"v2.0.1-beta", 2, "2.0"},
+		{"", 1, ""},
+		{"Unknown", 1, ""},
+	}
+	for _, c := range cases {
+		if got := Prefix(c.v, c.n); got != c.want {
+			t.Errorf("Prefix(%q,%d) = %q want %q", c.v, c.n, got, c.want)
+		}
+	}
+}

@@ -59,7 +59,18 @@ func (e *Engine) Uninstall(ctx context.Context, it *installed.Item, o UninstallO
 		return fmt.Errorf("uninstall failed with exit code %d (0x%08X)", code, uint32(code))
 	}
 	if rec != nil {
-		st.Remove(rec.ID)
+		// Several ARP entries can belong to one record (side-by-side
+		// versions); forget only the one that was removed.
+		var keep []string
+		for _, k := range rec.ARPKeys {
+			if !strings.EqualFold(k, a.Key) {
+				keep = append(keep, k)
+			}
+		}
+		rec.ARPKeys = keep
+		if len(keep) == 0 {
+			st.Remove(rec.ID)
+		}
 		if err := st.Save(); err != nil {
 			return err
 		}

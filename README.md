@@ -29,6 +29,7 @@ winget-go install --id 7zip.7zip -e --silent
 winget-go list --upgrade-available
 winget-go upgrade --all
 winget-go uninstall 7zip.7zip
+winget-go uninstall python --old-versions=minor --dry-run
 winget-go download --id jqlang.jq -e -d ./installers -a arm64
 winget-go export -o packages.json && winget-go import -i packages.json
 winget-go source update
@@ -56,6 +57,28 @@ winget-go upgrade --github                    # include GitHub releases in upgra
 
 The installer hash comes from GitHub's published asset digest. If GitHub has no digest for an asset, winget-go refuses to install it unless you pass `--ignore-security-hash`. Set `GITHUB_TOKEN` to raise the API rate limit.
 
+### Removing old versions
+
+Some products leave older versions installed side by side (Python, .NET runtimes, Java, Visual C++ runtimes, …). `uninstall --old-versions` removes the outdated ones and keeps the newest in each version line:
+
+```sh
+winget-go uninstall --old-versions --dry-run          # preview, all products
+winget-go uninstall python --old-versions             # keep newest 3.x (and newest 2.x)
+winget-go uninstall python --old-versions=minor       # keep newest 3.11.x, 3.12.x, …
+winget-go uninstall dotnet --old-versions=all         # keep only the newest overall
+winget-go uninstall java --old-versions --keep 2      # keep the two newest per line
+```
+
+| Value | Version line | Installed 3.11.4, 3.11.9, 3.12.1 → removed |
+|---|---|---|
+| `major` (default) | `3` | 3.11.4, 3.11.9 |
+| `minor` | `3.11`, `3.12` | 3.11.4 |
+| `all` | everything | 3.11.4, 3.11.9 |
+
+Put the value after `=` (`--old-versions=minor`). Without the `=`, the word would be read as a package query, so winget-go refuses it.
+
+Entries count as the same product only if they share a package Id (or display name and publisher), the same architecture, and the same per-user or per-machine scope. Only versions strictly older than every version being kept are removed. Entries with no version are left alone. Without a query, every installed product is checked and the exclusion list applies. On a terminal you are asked to confirm; `--disable-interactivity` skips the prompt.
+
 ### Exclusions
 
 You can stop specific packages from being upgraded. `upgrade`, `upgrade --all`, `list --upgrade-available` and `import` all skip excluded packages:
@@ -65,6 +88,8 @@ winget-go upgrade --all --exclude "Microsoft.Edge*" --exclude Google.Chrome
 winget-go upgrade --all --exclude-file ./exclusions.txt
 winget-go upgrade --all --no-exclude          # ignore every exclusion for this run
 ```
+
+Exclusions also protect packages from `uninstall --old-versions`.
 
 Patterns are case-insensitive wildcards (`*`, `?`, `[...]`) matched against the package Id. Start a pattern with `name:` to match the display name instead, e.g. `name:Visual Studio *`. An excluded package still appears in `list` (marked `(excluded)`) and in a footer after `upgrade`. Asking to upgrade it by name fails until you pass `--no-exclude`.
 

@@ -12,6 +12,7 @@ import (
 	"winget-go/internal/config"
 	"winget-go/internal/engine"
 	"winget-go/internal/exclude"
+	"winget-go/internal/installed"
 	"winget-go/internal/installer"
 	"winget-go/internal/source"
 )
@@ -247,11 +248,38 @@ func upgradeCmd(o Options) *cobra.Command {
 
 func uninstallCmd(o Options) *cobra.Command {
 	var q queryFlags
-	var interactive, silent, all bool
+	var ex excludeFlags
+	var interactive, silent, all, dryRun bool
+	var oldVersions string
+	var keep int
 	cmd := &cobra.Command{
 		Use: "uninstall [query]", Aliases: []string{"remove", "rm"},
 		Short: "Uninstalls the given package",
+		Long: `Uninstalls the given package.
+
+With --old-versions, removes outdated side-by-side versions instead: installed
+entries of the same product are grouped by version line and everything older
+than the newest --keep versions in each line is uninstalled.
+
+  --old-versions / --old-versions=major   3.11.4 and 3.12.1 are one line (keep 3.12.1)
+  --old-versions=minor                    3.11.x and 3.12.x are separate lines
+  --old-versions=all                      keep only the newest version overall
+
+The query is optional with --old-versions; without one, every installed product
+is considered (honouring the exclusion list). Use --dry-run to preview.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			mode := installer.ModeSilentWithProgress
+			if interactive {
+				mode = installer.ModeInteractive
+			} else if silent {
+				mode = installer.ModeSilent
+			}
+			if cmd.Flags().Changed("old-versions") {
+				return uninstallOldVersions(cmd, o, &q, &ex, args, oldVersions, keep, dryRun, mode)
+			}
+			if cmd.Flags().Changed("keep") || dryRun {
+				return errors.New("--keep and --dry-run require --old-versions")
+			}
 			if q.empty(args) {
 				return errors.New("a package query is required")
 			}
@@ -275,13 +303,7 @@ func uninstallCmd(o Options) *cobra.Command {
 					t.add(it.Name, it.ID(), it.Version)
 				}
 				t.print(o.Stdout)
-				return errors.New("multiple installed packages match; refine the query, or pass --all-versions")
-			}
-			mode := installer.ModeSilentWithProgress
-			if interactive {
-				mode = installer.ModeInteractive
-			} else if silent {
-				mode = installer.ModeSilent
+				return errors.New("multiple installed packages match; refine the query, pass --all-versions, or use --old-versions to remove only outdated ones")
 			}
 			for _, it := range items {
 				fmt.Fprintf(o.Stdout, "Found %s [%s]\n", it.Name, it.ID())
@@ -297,7 +319,112 @@ func uninstallCmd(o Options) *cobra.Command {
 	cmd.Flags().BoolVarP(&silent, "silent", "h", false, "Request silent uninstall")
 	cmd.Flags().BoolVar(&all, "all-versions", false, "Uninstall all matching entries")
 	cmd.Flags().Bool("force", false, "Accepted for compatibility")
+	cmd.Flags().StringVar(&oldVersions, "old-versions", "major",
+		"Uninstall outdated versions, keeping the newest per version line: major, minor or all")
+	cmd.Flags().Lookup("old-versions").NoOptDefVal = "major"
+	cmd.Flags().IntVar(&keep, "keep", 1, "With --old-versions: number of newest versions to keep per line")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "With --old-versions: show what would be removed without uninstalling")
+	ex.register(cmd)
 	return cmd
+}
+
+func uninstallOldVersions(cmd *cobra.Command, o Options, q *queryFlags, ex *excludeFlags,
+	args []string, lineFlag string, keep int, dryRun bool, mode installer.Mode) error {
+	line, err := engine.ParseVersionLine(lineFlag)
+	if err != nil {
+		return err
+	}
+	// --old-versions has an optional value, so "--old-versions minor" parses
+	// "minor" as the query. Catch that instead of searching for "minor".
+	for _, a := range args {
+		if _, err := engine.ParseVersionLine(a); err == nil && a != "" {
+			return fmt.Errorf("use --old-versions=%s (with '='); %q was read as a package query", a, a)
+		}
+	}
+	if keep < 1 {
+		return errors.New("--keep must be at least 1")
+	}
+	e, err := openEngine(cmd.Context(), o, q.source)
+	if err != nil {
+		return err
+	}
+	defer e.Close()
+	if e.Exclusions, err = ex.load(); err != nil {
+		return err
+	}
+	var items []*installed.Item
+	if q.empty(args) {
+		items, err = e.Installed()
+	} else {
+		items, err = e.FindInstalled(firstNonEmpty(strings.Join(args, " "), q.id, q.name, q.moniker), q.exact)
+	}
+	if err != nil {
+		return err
+	}
+	var candidates []*installed.Item
+	excluded := 0
+	for _, it := range items {
+		id := ""
+		if it.Package != nil {
+			id = it.Package.ID
+		}
+		if _, ok := e.IsExcluded(id, it.Name); ok {
+			excluded++
+			continue
+		}
+		candidates = append(candidates, it)
+	}
+	groups := engine.PlanOldVersions(candidates, line, keep)
+	if excluded > 0 {
+		fmt.Fprintf(o.Stdout, "Skipped %d installed entries matched by the exclusion list.\n", excluded)
+	}
+	if len(groups) == 0 {
+		fmt.Fprintln(o.Stdout, "No old versions found to remove.")
+		return nil
+	}
+	t := table{headers: []string{"Name", "Id", "Version", "Line", "Action"}}
+	var targets []*installed.Item
+	for _, g := range groups {
+		for _, it := range g.Keep {
+			t.add(it.Name, it.ID(), it.Version, g.Line, "keep")
+		}
+		for _, it := range g.Remove {
+			t.add(it.Name, it.ID(), it.Version, g.Line, "REMOVE")
+			targets = append(targets, it)
+		}
+	}
+	t.print(o.Stdout)
+	fmt.Fprintf(o.Stdout, "%d old version(s) to remove.\n", len(targets))
+	if dryRun {
+		fmt.Fprintln(o.Stdout, "Dry run: nothing was uninstalled.")
+		return nil
+	}
+	noPrompt, _ := cmd.Flags().GetBool("disable-interactivity")
+	if !noPrompt && isTerminal(os.Stdin) {
+		fmt.Fprint(o.Stdout, "Uninstall these versions? [Y/N]: ")
+		var answer string
+		fmt.Fscanln(os.Stdin, &answer)
+		if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+			return errors.New("cancelled")
+		}
+	}
+	var failed []string
+	for _, it := range targets {
+		fmt.Fprintf(o.Stdout, "Removing %s %s...\n", it.Name, it.Version)
+		if err := e.Uninstall(cmd.Context(), it, engine.UninstallOptions{Mode: mode}); err != nil {
+			fmt.Fprintf(o.Stderr, "  %v\n", err)
+			failed = append(failed, it.Name+" "+it.Version)
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("%d of %d old version(s) failed to uninstall: %s", len(failed), len(targets), strings.Join(failed, "; "))
+	}
+	return nil
+}
+
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 func exportCmd(o Options) *cobra.Command {

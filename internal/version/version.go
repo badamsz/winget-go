@@ -102,6 +102,28 @@ func rank(v string) int {
 	return 1
 }
 
+// Prefix returns the first n numeric components of v joined by ".",
+// padding with zeros: Prefix("3.11.4", 2) == "3.11", Prefix("7", 2) == "7.0".
+// It returns "" for empty or unknown versions.
+func Prefix(v string, n int) string {
+	if rank(v) != 1 {
+		return ""
+	}
+	ps := parse(v)
+	if len(ps) == 0 && strings.TrimSpace(v) == "" {
+		return ""
+	}
+	out := make([]string, n)
+	for i := range out {
+		var x uint64
+		if i < len(ps) {
+			x = ps[i].num
+		}
+		out[i] = strconv.FormatUint(x, 10)
+	}
+	return strings.Join(out, ".")
+}
+
 // Less reports whether a < b.
 func Less(a, b string) bool { return Compare(a, b) < 0 }
 

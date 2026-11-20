@@ -32,21 +32,7 @@ func alnum(s string) string {
 // NormalizeName returns candidate normalized names for an ARP display
 // name, with and without an architecture suffix.
 func NormalizeName(name string) []string {
-	arch := ""
-	switch {
-	case reArchArm.MatchString(name):
-		arch = "(Arm64)"
-	case reArch64.MatchString(name):
-		arch = "(X64)"
-	case reArch32.MatchString(name):
-		arch = "(X86)"
-	}
-	s := reParen.ReplaceAllString(name, " ")
-	s = reArchArm.ReplaceAllString(s, " ")
-	s = reArch64.ReplaceAllString(s, " ")
-	s = reArch32.ReplaceAllString(s, " ")
-	s = reVersion.ReplaceAllString(s, " ")
-	base := alnum(s)
+	base, arch, s := normalizeParts(name)
 	full := alnum(name)
 	seen := map[string]bool{}
 	var out []string
@@ -74,6 +60,34 @@ func NormalizeName(name string) []string {
 		}
 	}
 	return out
+}
+
+// normalizeParts returns the version-less normalized name, the
+// architecture suffix ("(X64)" etc.) and the intermediate cleaned string.
+func normalizeParts(name string) (base, arch, cleaned string) {
+	switch {
+	case reArchArm.MatchString(name):
+		arch = "(Arm64)"
+	case reArch64.MatchString(name):
+		arch = "(X64)"
+	case reArch32.MatchString(name):
+		arch = "(X86)"
+	}
+	s := reParen.ReplaceAllString(name, " ")
+	s = reArchArm.ReplaceAllString(s, " ")
+	s = reArch64.ReplaceAllString(s, " ")
+	s = reArch32.ReplaceAllString(s, " ")
+	s = reVersion.ReplaceAllString(s, " ")
+	return alnum(s), arch, s
+}
+
+// NameKey returns a grouping key for an Apps & Features display name: the
+// normalized name with versions removed, plus its architecture, so
+// "Python 3.11.4 (64-bit)" and "Python 3.11.9 (64-bit)" share a key but
+// x86 and x64 installs do not.
+func NameKey(name string) string {
+	base, arch, _ := normalizeParts(name)
+	return base + arch
 }
 
 // NormalizePublisher strips legal-entity suffixes and punctuation.
